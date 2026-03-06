@@ -62,6 +62,7 @@ class ThermalFieldSolver2D:
         self._scratch_width_next = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_theta_prev = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_theta_next = np.zeros(self._scratch_shape, dtype=float)
+        self._scratch_estimate = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_updated = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_source = np.zeros(self._scratch_shape, dtype=float)
         self._patch_theta_cells = max(1, int(round(self.parameters.theta_cells * self.parameters.source_patch_theta_fraction)))
@@ -74,6 +75,7 @@ class ThermalFieldSolver2D:
             dtype=int,
         )
         self._width_positions = np.linspace(-1.0, 1.0, self.parameters.width_zones, dtype=float) if self.parameters.width_zones > 1 else np.zeros(1, dtype=float)
+        self._source_layer_masks = self._build_source_layer_masks()
 
     @property
     def radial_centers_m(self) -> np.ndarray:
@@ -112,14 +114,13 @@ class ThermalFieldSolver2D:
         source.fill(0.0)
 
         if layer_source_weights:
-            _, _, _, _, layer_index = self.layer_property_maps(wear=0.0)
             layer_code = {"tread": 0, "belt": 1, "carcass": 2, "sidewall": 2, "inner_liner": 3}
             total_weight = max(float(sum(max(value, 0.0) for value in layer_source_weights.values())), 1e-12)
             for layer_name, weight in layer_source_weights.items():
                 if weight <= 0.0 or layer_name not in layer_code:
                     continue
-                mask = layer_index == layer_code[layer_name]
-                if not np.any(mask):
+                mask = self._source_layer_masks[layer_code[layer_name]]
+                if mask is None:
                     continue
                 source[mask] += max(volumetric_source_w_per_m3, 0.0) * max(params.source_volumetric_fraction, 0.0) * (weight / total_weight)
         else:
@@ -213,7 +214,6 @@ class ThermalFieldSolver2D:
         k_r = np.zeros_like(self._cell_volumes_m3)
         k_theta = np.zeros_like(self._cell_volumes_m3)
         k_w = np.zeros_like(self._cell_volumes_m3)
-        layer_index = np.broadcast_to(radial_layer_index[:, None, None], self._cell_volumes_m3.shape).copy()
 
         layer_params = (
             LayerEntry("tread", stack.tread),
@@ -251,6 +251,7 @@ class ThermalFieldSolver2D:
                 1e-4,
             )[None, None, :]
 
+        layer_index = np.broadcast_to(radial_layer_index[:, None, None], self._cell_volumes_m3.shape).copy()
         return rho_cp, k_r, k_theta, k_w, layer_index
 
     def layer_conductivity_scale_summary(
@@ -373,7 +374,7 @@ class ThermalFieldSolver2D:
             diffusion_iterations += substep_iterations
             if self.parameters.enable_profiling:
                 diffusion_time_s += time.perf_counter() - start
-            field = np.clip(field, self.parameters.minimum_temperature_k, self.parameters.maximum_temperature_k)
+            np.clip(field, self.parameters.minimum_temperature_k, self.parameters.maximum_temperature_k, out=field)
 
         actual_energy_j = self._total_energy_j(field, rho_cp=rho_cp)
         energy_residual_pct = abs(actual_energy_j - expected_energy_j) / max(abs(expected_energy_j), 1.0) * 100.0
@@ -403,6 +404,13 @@ class ThermalFieldSolver2D:
         x = np.linspace(0.0, 1.0, params.radial_cells + 1, dtype=float)
         stretched = 1.0 - np.power(1.0 - x, bias)
         return params.inner_radius_m + stretched * (params.outer_radius_m - params.inner_radius_m)
+
+    def _build_source_layer_masks(self) -> tuple[np.ndarray | None, ...]:
+        _, _, _, _, layer_index = self.layer_property_maps(wear=0.0)
+        return tuple(
+            mask if np.any(mask) else None
+            for mask in (layer_index == layer_code for layer_code in range(4))
+        )
 
     def _build_cell_volumes_m3(self) -> np.ndarray:
         radial_cells = self.parameters.radial_cells
@@ -498,7 +506,8 @@ class ThermalFieldSolver2D:
         coeff_w_plus = dt_s * alpha_w * self._width_coeff_plus[None, None, :]
 
         diagonal = 1.0 + coeff_r_minus + coeff_r_plus + 2.0 * coeff_theta + coeff_w_minus + coeff_w_plus
-        estimate = rhs.copy()
+        estimate = self._scratch_estimate
+        np.copyto(estimate, rhs)
         iterations = 0
         radial_prev = self._scratch_radial_prev
         radial_next = self._scratch_radial_next
@@ -530,10 +539,10 @@ class ThermalFieldSolver2D:
             updated += coeff_w_plus * width_next
             updated /= np.maximum(diagonal, 1e-12)
             max_delta = float(np.max(np.abs(updated - estimate)))
-            estimate = updated.copy()
+            estimate, updated = updated, estimate
             if max_delta < self.parameters.diffusion_tolerance_k:
                 break
-        return estimate, iterations
+        return np.array(estimate, copy=True), iterations
 
     def _total_energy_j(self, field: np.ndarray, *, rho_cp: np.ndarray) -> float:
         return float(np.sum(field * rho_cp * self._cell_volumes_m3))

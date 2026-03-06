@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -60,6 +61,23 @@ class FidelityPreset:
     lhs_samples: int
     sobol_samples: int
     diagnostics_stride: int
+
+
+@dataclass
+class ProgressTracker:
+    bar: tqdm | None = None
+
+    def set_phase(self, label: str) -> None:
+        if self.bar is not None:
+            self.bar.set_description(label)
+
+    def advance(self, amount: int = 1) -> None:
+        if self.bar is not None and amount > 0:
+            self.bar.update(amount)
+
+    def close(self) -> None:
+        if self.bar is not None:
+            self.bar.close()
 
 
 PRESETS: dict[str, FidelityPreset] = {
@@ -293,12 +311,46 @@ def _batch_size(item_count: int, workers: int) -> int:
     return max(1, item_count // max(workers * 4, 1))
 
 
-def _process_pool_map(worker_fn, tasks: list[dict], workers: int) -> list[object]:
+def _iter_process_pool_map(worker_fn, tasks: list[dict], workers: int):
     if len(tasks) == 0:
-        return []
+        return
     start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
     with mp.get_context(start_method).Pool(processes=workers) as pool:
-        return pool.map(worker_fn, tasks)
+        yield from pool.imap_unordered(worker_fn, tasks, chunksize=1)
+
+
+def _run_scenario_task(task: dict) -> tuple[str, dict]:
+    scenario: ScenarioConfig = task["scenario"]
+    result = run_single_scenario(
+        scenario=scenario,
+        tire_parameters=task["tire_parameters"],
+        vehicle_parameters=task["vehicle_parameters"],
+        dt_s=task["dt_s"],
+        diagnostics_stride=task["diagnostics_stride"],
+        inputs=task["inputs"],
+        prepared_inputs=task["prepared_inputs"],
+    )
+    return scenario.name, result
+
+
+def _evaluate_lhs_sample(task: dict) -> tuple[int, dict[str, tuple[list[float], list[float]]]]:
+    batch_result = _evaluate_lhs_batch(
+        {
+            **task,
+            "batch": [(task["sample_idx"], task["sample"])],
+        }
+    )
+    return batch_result[0]
+
+
+def _evaluate_sobol_sample(task: dict) -> tuple[int, float]:
+    batch_result = _evaluate_sobol_batch(
+        {
+            **task,
+            "batch": [(task["eval_idx"], task["sample"])],
+        }
+    )
+    return batch_result[0]
 
 
 def _evaluate_lhs_batch(task: dict) -> list[tuple[int, dict[str, tuple[list[float], list[float]]]]]:
@@ -360,6 +412,33 @@ def _evaluate_sobol_batch(task: dict) -> list[tuple[int, float]]:
     return outputs
 
 
+def _should_enable_progress(enabled: bool | None) -> bool:
+    if enabled is not None:
+        return enabled
+    return sys.stderr.isatty()
+
+
+def _build_progress_tracker(
+    *,
+    scenarios: tuple[ScenarioConfig, ...],
+    lhs_samples: int,
+    sobol_eval_count: int,
+    enabled: bool | None,
+) -> ProgressTracker:
+    if not _should_enable_progress(enabled):
+        return ProgressTracker()
+    total = len(scenarios) + lhs_samples + sobol_eval_count
+    bar = tqdm(
+        total=total,
+        desc="baseline",
+        unit="run",
+        dynamic_ncols=True,
+        leave=True,
+        file=sys.stderr,
+    )
+    return ProgressTracker(bar=bar)
+
+
 def run_high_fidelity_no_data(
     *,
     output_path: Path = RESULTS_FILE,
@@ -372,6 +451,7 @@ def run_high_fidelity_no_data(
     duration_scale: float = 1.0,
     diagnostics_stride: int | None = None,
     workers: int = 1,
+    progress: bool | None = None,
     tire_parameters: HighFidelityTireModelParameters | None = None,
     vehicle_parameters: VehicleParameters | None = None,
 ) -> dict:
@@ -389,12 +469,20 @@ def run_high_fidelity_no_data(
     )
     vehicle_params = vehicle_parameters if vehicle_parameters is not None else VehicleParameters()
     scenarios = default_scenarios(duration_scale=duration_scale)
+    progress_tracker = _build_progress_tracker(
+        scenarios=scenarios,
+        lhs_samples=lhs_samples,
+        sobol_eval_count=sobol_samples * (2 + len(HighFidelityUQ().default_tire_priors(parameters=tire_params))),
+        enabled=progress,
+    )
     baseline = run_scenario_pack(
         scenarios=scenarios,
         tire_parameters=tire_params,
         vehicle_parameters=vehicle_params,
         dt_s=dt_s,
         diagnostics_stride=diagnostics_stride,
+        workers=workers,
+        progress_tracker=progress_tracker,
     )
 
     uq = HighFidelityUQ()
@@ -409,6 +497,7 @@ def run_high_fidelity_no_data(
         seed=seed,
         diagnostics_stride=diagnostics_stride,
         workers=workers,
+        progress_tracker=progress_tracker,
     )
     sobol_result = run_sobol_uq(
         scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
@@ -420,6 +509,7 @@ def run_high_fidelity_no_data(
         seed=seed,
         diagnostics_stride=diagnostics_stride,
         workers=workers,
+        progress_tracker=progress_tracker,
     )
 
     artifact = {
@@ -453,6 +543,8 @@ def run_high_fidelity_no_data(
     output_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     summary_text = render_high_fidelity_no_data_summary(artifact)
     summary_path.write_text(summary_text, encoding="utf-8")
+    progress_tracker.set_phase("done")
+    progress_tracker.close()
     return artifact
 
 
@@ -463,6 +555,8 @@ def run_scenario_pack(
     vehicle_parameters: VehicleParameters,
     dt_s: float,
     diagnostics_stride: int = 1,
+    workers: int = 1,
+    progress_tracker: ProgressTracker | None = None,
 ) -> dict:
     simulator = _vehicle_simulator(
         tire_parameters=tire_parameters,
@@ -474,19 +568,47 @@ def run_scenario_pack(
     }
     scenario_traces: dict[str, dict] = {}
     scenario_summaries: dict[str, dict] = {}
-    for scenario in scenarios:
-        result = run_single_scenario(
-            scenario=scenario,
-            tire_parameters=tire_parameters,
-            vehicle_parameters=vehicle_parameters,
-            dt_s=dt_s,
-            diagnostics_stride=diagnostics_stride,
-            simulator=simulator,
-            inputs=scenario_inputs[scenario.name],
-            prepared_inputs=scenario_prepared_inputs[scenario.name],
+    if progress_tracker is not None:
+        progress_tracker.set_phase("baseline")
+    if workers > 1 and len(scenarios) > 1:
+        scenario_order = {scenario.name: idx for idx, scenario in enumerate(scenarios)}
+        tasks = [
+            {
+                "scenario": scenario,
+                "tire_parameters": tire_parameters,
+                "vehicle_parameters": vehicle_parameters,
+                "dt_s": dt_s,
+                "diagnostics_stride": diagnostics_stride,
+                "inputs": scenario_inputs[scenario.name],
+                "prepared_inputs": scenario_prepared_inputs[scenario.name],
+            }
+            for scenario in scenarios
+        ]
+        scenario_results = sorted(
+            _iter_process_pool_map(_run_scenario_task, tasks, workers=min(workers, len(tasks))),
+            key=lambda item: scenario_order[item[0]],
         )
-        scenario_traces[scenario.name] = result["trace"]
-        scenario_summaries[scenario.name] = result["summary"]
+        for scenario_name, result in scenario_results:
+            scenario_traces[scenario_name] = result["trace"]
+            scenario_summaries[scenario_name] = result["summary"]
+            if progress_tracker is not None:
+                progress_tracker.advance(1)
+    else:
+        for scenario in scenarios:
+            result = run_single_scenario(
+                scenario=scenario,
+                tire_parameters=tire_parameters,
+                vehicle_parameters=vehicle_parameters,
+                dt_s=dt_s,
+                diagnostics_stride=diagnostics_stride,
+                simulator=simulator,
+                inputs=scenario_inputs[scenario.name],
+                prepared_inputs=scenario_prepared_inputs[scenario.name],
+            )
+            scenario_traces[scenario.name] = result["trace"]
+            scenario_summaries[scenario.name] = result["summary"]
+            if progress_tracker is not None:
+                progress_tracker.advance(1)
     return {
         "scenario_traces": scenario_traces,
         "scenario_summaries": scenario_summaries,
@@ -583,6 +705,7 @@ def run_lhs_uq(
     seed: int,
     diagnostics_stride: int = 1,
     workers: int = 1,
+    progress_tracker: ProgressTracker | None = None,
 ) -> dict:
     priors = uq.default_tire_priors(parameters=tire_parameters)
     unit_samples = uq.latin_hypercube(priors=priors, sample_count=lhs_samples, seed=seed)
@@ -601,11 +724,13 @@ def run_lhs_uq(
         for sample_idx in range(lhs_samples)
     ]
     lhs_results: list[tuple[int, dict[str, tuple[list[float], list[float]]]]] = []
+    if progress_tracker is not None:
+        progress_tracker.set_phase("lhs")
     if workers > 1 and lhs_samples > 1:
-        batch_size = _batch_size(len(sample_payloads), workers)
         tasks = [
             {
-                "batch": batch,
+                "sample_idx": sample_idx,
+                "sample": sample,
                 "scenarios": scenarios,
                 "scenario_inputs": scenario_inputs,
                 "tire_parameters": tire_parameters,
@@ -613,10 +738,12 @@ def run_lhs_uq(
                 "dt_s": dt_s,
                 "diagnostics_stride": diagnostics_stride,
             }
-            for batch in _batched(sample_payloads, batch_size)
+            for sample_idx, sample in sample_payloads
         ]
-        for batch_result in _process_pool_map(_evaluate_lhs_batch, tasks, workers):
-            lhs_results.extend(batch_result)
+        for sample_result in _iter_process_pool_map(_evaluate_lhs_sample, tasks, workers):
+            lhs_results.append(sample_result)
+            if progress_tracker is not None:
+                progress_tracker.advance(1)
     else:
         lhs_results = _evaluate_lhs_batch(
             {
@@ -629,6 +756,8 @@ def run_lhs_uq(
                 "diagnostics_stride": diagnostics_stride,
             }
         )
+        if progress_tracker is not None:
+            progress_tracker.advance(len(lhs_results))
 
     lhs_results.sort(key=lambda item: item[0])
     for _sample_idx, sample_result in lhs_results:
@@ -685,6 +814,7 @@ def run_sobol_uq(
     seed: int,
     diagnostics_stride: int = 1,
     workers: int = 1,
+    progress_tracker: ProgressTracker | None = None,
 ) -> dict:
     priors = uq.default_tire_priors(parameters=tire_parameters)
     scenario_inputs = _vehicle_inputs_for_scenario(scenario)
@@ -711,11 +841,13 @@ def run_sobol_uq(
             ))
 
     sobol_results: list[tuple[int, float]] = []
+    if progress_tracker is not None:
+        progress_tracker.set_phase("sobol")
     if workers > 1 and len(eval_payloads) > 1:
-        batch_size = _batch_size(len(eval_payloads), workers)
         tasks = [
             {
-                "batch": batch,
+                "eval_idx": eval_idx,
+                "sample": sample,
                 "scenario": scenario,
                 "scenario_inputs": scenario_inputs,
                 "tire_parameters": tire_parameters,
@@ -723,10 +855,12 @@ def run_sobol_uq(
                 "dt_s": dt_s,
                 "diagnostics_stride": diagnostics_stride,
             }
-            for batch in _batched(eval_payloads, batch_size)
+            for eval_idx, sample in eval_payloads
         ]
-        for batch_result in _process_pool_map(_evaluate_sobol_batch, tasks, workers):
-            sobol_results.extend(batch_result)
+        for sample_result in _iter_process_pool_map(_evaluate_sobol_sample, tasks, workers):
+            sobol_results.append(sample_result)
+            if progress_tracker is not None:
+                progress_tracker.advance(1)
     else:
         sobol_results = _evaluate_sobol_batch(
             {
@@ -739,6 +873,8 @@ def run_sobol_uq(
                 "diagnostics_stride": diagnostics_stride,
             }
         )
+        if progress_tracker is not None:
+            progress_tracker.advance(len(sobol_results))
 
     ordered_results = np.zeros(len(eval_payloads), dtype=float)
     for eval_idx, value in sobol_results:
@@ -856,6 +992,8 @@ def main() -> None:
     parser.add_argument("--internal-dt-s", type=float, default=None)
     parser.add_argument("--diagnostics-stride", type=int, default=None)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--progress", action="store_true", default=None)
+    parser.add_argument("--no-progress", dest="progress", action="store_false")
     args = parser.parse_args()
 
     preset = fidelity_preset(args.preset)
@@ -875,6 +1013,7 @@ def main() -> None:
         duration_scale=args.duration_scale,
         diagnostics_stride=preset.diagnostics_stride if args.diagnostics_stride is None else args.diagnostics_stride,
         workers=max(int(args.workers), 1),
+        progress=args.progress,
         tire_parameters=tire_parameters,
     )
 
