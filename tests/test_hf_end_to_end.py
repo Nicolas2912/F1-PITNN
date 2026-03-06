@@ -34,12 +34,33 @@ def _load_modules():
     return root, run_module, report_module
 
 
+def _normalized_artifact(payload: dict) -> dict:
+    normalized = json.loads(json.dumps(payload))
+    metadata = normalized.get("metadata", {})
+    for key in ("created_at_utc", "results_path", "summary_path"):
+        metadata.pop(key, None)
+    return normalized
+
+
+def _normalized_summary(text: str) -> str:
+    return "\n".join(
+        line
+        for line in text.splitlines()
+        if not line.startswith("- created_at_utc:")
+        and not line.startswith("- results_json:")
+        and not line.startswith("- summary_md:")
+    )
+
+
 def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path) -> None:
     _root, run_module, report_module = _load_modules()
     default_params = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
     assert default_params.use_local_temp_friction_partition
     assert default_params.use_reduced_patch_mechanics
     assert default_params.use_structural_hysteresis_model
+    assert default_params.internal_coupling.enabled
+    assert default_params.local_contact.enabled
+    assert default_params.construction.enabled
     results_path = tmp_path / "hf_results.json"
     summary_path = tmp_path / "hf_summary.md"
     rerendered_summary_path = tmp_path / "hf_summary_rerendered.md"
@@ -76,6 +97,54 @@ def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path
     assert summary_text.startswith("# High-Fidelity No-Data Summary")
     assert "## UQ-First Scenario Metrics" in summary_text
     assert "## Sobol Ranking" in summary_text
+
+
+def test_p8_end_to_end_parallel_workers_match_serial_outputs(tmp_path: Path) -> None:
+    _root, run_module, report_module = _load_modules()
+    serial_results_path = tmp_path / "hf_serial.json"
+    serial_summary_path = tmp_path / "hf_serial.md"
+    parallel_results_path = tmp_path / "hf_parallel.json"
+    parallel_summary_path = tmp_path / "hf_parallel.md"
+
+    run_module.run_high_fidelity_no_data(
+        preset="smoke",
+        output_path=serial_results_path,
+        summary_path=serial_summary_path,
+        seed=77,
+        dt_s=0.2,
+        duration_scale=0.05,
+        lhs_samples=2,
+        sobol_samples=2,
+        workers=1,
+    )
+    run_module.run_high_fidelity_no_data(
+        preset="smoke",
+        output_path=parallel_results_path,
+        summary_path=parallel_summary_path,
+        seed=77,
+        dt_s=0.2,
+        duration_scale=0.05,
+        lhs_samples=2,
+        sobol_samples=2,
+        workers=2,
+    )
+
+    serial_payload = json.loads(serial_results_path.read_text(encoding="utf-8"))
+    parallel_payload = json.loads(parallel_results_path.read_text(encoding="utf-8"))
+    assert _normalized_artifact(serial_payload) == _normalized_artifact(parallel_payload)
+    assert _normalized_summary(serial_summary_path.read_text(encoding="utf-8")) == _normalized_summary(
+        parallel_summary_path.read_text(encoding="utf-8")
+    )
+
+    serial_rerendered = report_module.write_high_fidelity_no_data_report(
+        results_path=serial_results_path,
+        output_path=tmp_path / "hf_serial_rerendered.md",
+    )
+    parallel_rerendered = report_module.write_high_fidelity_no_data_report(
+        results_path=parallel_results_path,
+        output_path=tmp_path / "hf_parallel_rerendered.md",
+    )
+    assert _normalized_summary(serial_rerendered) == _normalized_summary(parallel_rerendered)
 
 
 @pytest.mark.slow

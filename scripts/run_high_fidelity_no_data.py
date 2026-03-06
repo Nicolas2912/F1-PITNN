@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import json
+import multiprocessing as mp
 from pathlib import Path
 import sys
 
@@ -16,6 +17,7 @@ from models.high_fidelity import (  # noqa: E402
     HighFidelityUQ,
     HighFidelityVehicleSimulator,
 )
+from models.high_fidelity.types import ConstructionParameters, InternalCouplingParameters, LocalContactParameters  # noqa: E402
 from models.high_fidelity.reporting import render_high_fidelity_no_data_summary  # noqa: E402
 from models.vehicle_thermal import VehicleInputs, VehicleParameters  # noqa: E402
 
@@ -111,6 +113,9 @@ def default_tire_parameters(
         use_local_temp_friction_partition=True,
         use_reduced_patch_mechanics=True,
         use_structural_hysteresis_model=True,
+        internal_coupling=InternalCouplingParameters(enabled=True),
+        local_contact=LocalContactParameters(enabled=True),
+        construction=ConstructionParameters(enabled=True),
         radial_cells=radial_cells,
         theta_cells=theta_cells,
         internal_solver_dt_s=internal_solver_dt_s,
@@ -278,6 +283,83 @@ def _vehicle_simulator(
     )
 
 
+def _batched(items: list[object], batch_size: int) -> list[list[object]]:
+    if len(items) == 0:
+        return []
+    return [items[idx : idx + batch_size] for idx in range(0, len(items), batch_size)]
+
+
+def _batch_size(item_count: int, workers: int) -> int:
+    return max(1, item_count // max(workers * 4, 1))
+
+
+def _process_pool_map(worker_fn, tasks: list[dict], workers: int) -> list[object]:
+    if len(tasks) == 0:
+        return []
+    start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+    with mp.get_context(start_method).Pool(processes=workers) as pool:
+        return pool.map(worker_fn, tasks)
+
+
+def _evaluate_lhs_batch(task: dict) -> list[tuple[int, dict[str, tuple[list[float], list[float]]]]]:
+    uq = HighFidelityUQ()
+    scenarios: tuple[ScenarioConfig, ...] = task["scenarios"]
+    scenario_inputs: dict[str, VehicleInputs] = task["scenario_inputs"]
+    outputs: list[tuple[int, dict[str, tuple[list[float], list[float]]]]] = []
+    for sample_idx, sample in task["batch"]:
+        sampled_tire_parameters = uq.apply_sample(base=task["tire_parameters"], sample=sample)
+        simulator = _vehicle_simulator(
+            tire_parameters=sampled_tire_parameters,
+            vehicle_parameters=task["vehicle_parameters"],
+        )
+        prepared_inputs = {
+            scenario.name: simulator.prepare_inputs(scenario_inputs[scenario.name]) for scenario in scenarios
+        }
+        scenario_results: dict[str, tuple[list[float], list[float]]] = {}
+        for scenario in scenarios:
+            result = run_single_scenario(
+                scenario=scenario,
+                tire_parameters=sampled_tire_parameters,
+                vehicle_parameters=task["vehicle_parameters"],
+                dt_s=task["dt_s"],
+                diagnostics_stride=task["diagnostics_stride"],
+                simulator=simulator,
+                inputs=scenario_inputs[scenario.name],
+                prepared_inputs=prepared_inputs[scenario.name],
+            )
+            scenario_results[scenario.name] = (
+                result["trace"]["mean_core_temp_c"],
+                result["trace"]["mean_surface_temp_c"],
+            )
+        outputs.append((sample_idx, scenario_results))
+    return outputs
+
+
+def _evaluate_sobol_batch(task: dict) -> list[tuple[int, float]]:
+    uq = HighFidelityUQ()
+    scenario: ScenarioConfig = task["scenario"]
+    scenario_inputs: VehicleInputs = task["scenario_inputs"]
+    outputs: list[tuple[int, float]] = []
+    for eval_idx, sample in task["batch"]:
+        sampled_tire_parameters = uq.apply_sample(base=task["tire_parameters"], sample=sample)
+        simulator = _vehicle_simulator(
+            tire_parameters=sampled_tire_parameters,
+            vehicle_parameters=task["vehicle_parameters"],
+        )
+        result = run_single_scenario(
+            scenario=scenario,
+            tire_parameters=sampled_tire_parameters,
+            vehicle_parameters=task["vehicle_parameters"],
+            dt_s=task["dt_s"],
+            diagnostics_stride=task["diagnostics_stride"],
+            simulator=simulator,
+            inputs=scenario_inputs,
+            prepared_inputs=simulator.prepare_inputs(scenario_inputs),
+        )
+        outputs.append((eval_idx, float(result["summary"]["peak_mean_surface_temp_c"])))
+    return outputs
+
+
 def run_high_fidelity_no_data(
     *,
     output_path: Path = RESULTS_FILE,
@@ -289,6 +371,7 @@ def run_high_fidelity_no_data(
     dt_s: float = 0.2,
     duration_scale: float = 1.0,
     diagnostics_stride: int | None = None,
+    workers: int = 1,
     tire_parameters: HighFidelityTireModelParameters | None = None,
     vehicle_parameters: VehicleParameters | None = None,
 ) -> dict:
@@ -325,6 +408,7 @@ def run_high_fidelity_no_data(
         lhs_samples=lhs_samples,
         seed=seed,
         diagnostics_stride=diagnostics_stride,
+        workers=workers,
     )
     sobol_result = run_sobol_uq(
         scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
@@ -335,6 +419,7 @@ def run_high_fidelity_no_data(
         sobol_samples=sobol_samples,
         seed=seed,
         diagnostics_stride=diagnostics_stride,
+        workers=workers,
     )
 
     artifact = {
@@ -384,6 +469,9 @@ def run_scenario_pack(
         vehicle_parameters=vehicle_parameters,
     )
     scenario_inputs = {scenario.name: _vehicle_inputs_for_scenario(scenario) for scenario in scenarios}
+    scenario_prepared_inputs = {
+        scenario.name: simulator.prepare_inputs(scenario_inputs[scenario.name]) for scenario in scenarios
+    }
     scenario_traces: dict[str, dict] = {}
     scenario_summaries: dict[str, dict] = {}
     for scenario in scenarios:
@@ -395,6 +483,7 @@ def run_scenario_pack(
             diagnostics_stride=diagnostics_stride,
             simulator=simulator,
             inputs=scenario_inputs[scenario.name],
+            prepared_inputs=scenario_prepared_inputs[scenario.name],
         )
         scenario_traces[scenario.name] = result["trace"]
         scenario_summaries[scenario.name] = result["summary"]
@@ -413,12 +502,16 @@ def run_single_scenario(
     diagnostics_stride: int = 1,
     simulator: HighFidelityVehicleSimulator | None = None,
     inputs: VehicleInputs | None = None,
+    prepared_inputs=None,
 ) -> dict:
     active_simulator = simulator if simulator is not None else _vehicle_simulator(
         tire_parameters=tire_parameters,
         vehicle_parameters=vehicle_parameters,
     )
     active_inputs = inputs if inputs is not None else _vehicle_inputs_for_scenario(scenario)
+    active_prepared_inputs = (
+        active_simulator.prepare_inputs(active_inputs) if prepared_inputs is None else prepared_inputs
+    )
     state = active_simulator.initial_state(ambient_temp_k=scenario.ambient_temp_k)
 
     steps = max(int(round(scenario.duration_s / dt_s)), 1)
@@ -430,7 +523,7 @@ def run_single_scenario(
     coupling_converged_fraction = []
     any_non_finite = False
 
-    initial_diag = active_simulator.diagnostics(state, active_inputs)
+    initial_diag = active_simulator.diagnostics(state, active_inputs, prepared_inputs=active_prepared_inputs)
     mean_core_temp_c.append(_mean_dict_value(initial_diag.wheel_core_temp_c))
     mean_surface_temp_c.append(_mean_dict_value(initial_diag.wheel_surface_temp_c))
     load_error_pct.append(initial_diag.load_conservation_error_pct)
@@ -443,9 +536,9 @@ def run_single_scenario(
 
     diagnostics_stride = max(int(diagnostics_stride), 1)
     for step in range(1, steps + 1):
-        state = active_simulator.step(state, active_inputs, dt_s=dt_s)
+        state = active_simulator.step(state, active_inputs, dt_s=dt_s, prepared_inputs=active_prepared_inputs)
         if step % diagnostics_stride == 0 or step == steps:
-            diag = active_simulator.diagnostics(state, active_inputs)
+            diag = active_simulator.diagnostics(state, active_inputs, prepared_inputs=active_prepared_inputs)
             time_s.append(step * dt_s)
             mean_core_temp_c.append(_mean_dict_value(diag.wheel_core_temp_c))
             mean_surface_temp_c.append(_mean_dict_value(diag.wheel_surface_temp_c))
@@ -489,6 +582,7 @@ def run_lhs_uq(
     lhs_samples: int,
     seed: int,
     diagnostics_stride: int = 1,
+    workers: int = 1,
 ) -> dict:
     priors = uq.default_tire_priors(parameters=tire_parameters)
     unit_samples = uq.latin_hypercube(priors=priors, sample_count=lhs_samples, seed=seed)
@@ -502,25 +596,45 @@ def run_lhs_uq(
     scenario_end_surface_metrics: dict[str, list[float]] = {scenario.name: [] for scenario in scenarios}
     scenario_peak_surface_metrics: dict[str, list[float]] = {scenario.name: [] for scenario in scenarios}
 
-    for sample_idx in range(lhs_samples):
-        sample = {prior.name: float(mapped[prior.name][sample_idx]) for prior in priors}
-        sampled_tire_parameters = uq.apply_sample(base=tire_parameters, sample=sample)
-        simulator = _vehicle_simulator(
-            tire_parameters=sampled_tire_parameters,
-            vehicle_parameters=vehicle_parameters,
+    sample_payloads = [
+        (sample_idx, {prior.name: float(mapped[prior.name][sample_idx]) for prior in priors})
+        for sample_idx in range(lhs_samples)
+    ]
+    lhs_results: list[tuple[int, dict[str, tuple[list[float], list[float]]]]] = []
+    if workers > 1 and lhs_samples > 1:
+        batch_size = _batch_size(len(sample_payloads), workers)
+        tasks = [
+            {
+                "batch": batch,
+                "scenarios": scenarios,
+                "scenario_inputs": scenario_inputs,
+                "tire_parameters": tire_parameters,
+                "vehicle_parameters": vehicle_parameters,
+                "dt_s": dt_s,
+                "diagnostics_stride": diagnostics_stride,
+            }
+            for batch in _batched(sample_payloads, batch_size)
+        ]
+        for batch_result in _process_pool_map(_evaluate_lhs_batch, tasks, workers):
+            lhs_results.extend(batch_result)
+    else:
+        lhs_results = _evaluate_lhs_batch(
+            {
+                "batch": sample_payloads,
+                "scenarios": scenarios,
+                "scenario_inputs": scenario_inputs,
+                "tire_parameters": tire_parameters,
+                "vehicle_parameters": vehicle_parameters,
+                "dt_s": dt_s,
+                "diagnostics_stride": diagnostics_stride,
+            }
         )
+
+    lhs_results.sort(key=lambda item: item[0])
+    for _sample_idx, sample_result in lhs_results:
         for scenario in scenarios:
-            result = run_single_scenario(
-                scenario=scenario,
-                tire_parameters=sampled_tire_parameters,
-                vehicle_parameters=vehicle_parameters,
-                dt_s=dt_s,
-                diagnostics_stride=diagnostics_stride,
-                simulator=simulator,
-                inputs=scenario_inputs[scenario.name],
-            )
-            core_trace = np.asarray(result["trace"]["mean_core_temp_c"], dtype=float)
-            surface_trace = np.asarray(result["trace"]["mean_surface_temp_c"], dtype=float)
+            core_trace = np.asarray(sample_result[scenario.name][0], dtype=float)
+            surface_trace = np.asarray(sample_result[scenario.name][1], dtype=float)
             scenario_core_traces[scenario.name].append(core_trace)
             scenario_surface_traces[scenario.name].append(surface_trace)
             scenario_end_metrics[scenario.name].append(float(core_trace[-1]))
@@ -570,32 +684,76 @@ def run_sobol_uq(
     sobol_samples: int,
     seed: int,
     diagnostics_stride: int = 1,
+    workers: int = 1,
 ) -> dict:
     priors = uq.default_tire_priors(parameters=tire_parameters)
     scenario_inputs = _vehicle_inputs_for_scenario(scenario)
+    prior_names = tuple(prior.name for prior in priors)
+    unit_a = uq.random_unit_samples(priors=priors, sample_count=sobol_samples, seed=seed)
+    unit_b = uq.random_unit_samples(priors=priors, sample_count=sobol_samples, seed=seed + 1)
+    matrix_a = uq._map_prior_matrix(unit_samples=unit_a, priors=priors)
+    matrix_b = uq._map_prior_matrix(unit_samples=unit_b, priors=priors)
 
-    def objective(sample: dict[str, float]) -> float:
-        sampled_tire_parameters = uq.apply_sample(base=tire_parameters, sample=sample)
-        simulator = _vehicle_simulator(
-            tire_parameters=sampled_tire_parameters,
-            vehicle_parameters=vehicle_parameters,
-        )
-        result = run_single_scenario(
-            scenario=scenario,
-            tire_parameters=sampled_tire_parameters,
-            vehicle_parameters=vehicle_parameters,
-            dt_s=dt_s,
-            diagnostics_stride=diagnostics_stride,
-            simulator=simulator,
-            inputs=scenario_inputs,
-        )
-        return float(result["summary"]["peak_mean_surface_temp_c"])
+    eval_payloads: list[tuple[int, dict[str, float]]] = []
+    y_ab_offsets: list[int] = []
+    for row_idx in range(sobol_samples):
+        eval_payloads.append((row_idx, {name: float(value) for name, value in zip(prior_names, matrix_a[row_idx], strict=True)}))
+    for row_idx in range(sobol_samples):
+        eval_payloads.append((sobol_samples + row_idx, {name: float(value) for name, value in zip(prior_names, matrix_b[row_idx], strict=True)}))
+    for dim in range(len(priors)):
+        y_ab_offsets.append(len(eval_payloads))
+        matrix_ab = matrix_a.copy()
+        matrix_ab[:, dim] = matrix_b[:, dim]
+        for row_idx in range(sobol_samples):
+            eval_payloads.append((
+                y_ab_offsets[-1] + row_idx,
+                {name: float(value) for name, value in zip(prior_names, matrix_ab[row_idx], strict=True)},
+            ))
 
-    sobol = uq.sobol_indices(
+    sobol_results: list[tuple[int, float]] = []
+    if workers > 1 and len(eval_payloads) > 1:
+        batch_size = _batch_size(len(eval_payloads), workers)
+        tasks = [
+            {
+                "batch": batch,
+                "scenario": scenario,
+                "scenario_inputs": scenario_inputs,
+                "tire_parameters": tire_parameters,
+                "vehicle_parameters": vehicle_parameters,
+                "dt_s": dt_s,
+                "diagnostics_stride": diagnostics_stride,
+            }
+            for batch in _batched(eval_payloads, batch_size)
+        ]
+        for batch_result in _process_pool_map(_evaluate_sobol_batch, tasks, workers):
+            sobol_results.extend(batch_result)
+    else:
+        sobol_results = _evaluate_sobol_batch(
+            {
+                "batch": eval_payloads,
+                "scenario": scenario,
+                "scenario_inputs": scenario_inputs,
+                "tire_parameters": tire_parameters,
+                "vehicle_parameters": vehicle_parameters,
+                "dt_s": dt_s,
+                "diagnostics_stride": diagnostics_stride,
+            }
+        )
+
+    ordered_results = np.zeros(len(eval_payloads), dtype=float)
+    for eval_idx, value in sobol_results:
+        ordered_results[eval_idx] = value
+    y_a = ordered_results[:sobol_samples]
+    y_b = ordered_results[sobol_samples : 2 * sobol_samples]
+    y_ab_by_dim = [
+        ordered_results[offset : offset + sobol_samples]
+        for offset in y_ab_offsets
+    ]
+    sobol = uq.sobol_indices_from_evaluations(
         priors=priors,
-        model_fn=objective,
-        sample_count=sobol_samples,
-        seed=seed,
+        y_a=y_a,
+        y_b=y_b,
+        y_ab_by_dim=y_ab_by_dim,
     )
     return {
         "objective_metric": f"{scenario.name}.peak_mean_surface_temp_c",
@@ -697,6 +855,7 @@ def main() -> None:
     parser.add_argument("--theta-cells", type=int, default=None)
     parser.add_argument("--internal-dt-s", type=float, default=None)
     parser.add_argument("--diagnostics-stride", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
 
     preset = fidelity_preset(args.preset)
@@ -715,6 +874,7 @@ def main() -> None:
         dt_s=args.dt_s,
         duration_scale=args.duration_scale,
         diagnostics_stride=preset.diagnostics_stride if args.diagnostics_stride is None else args.diagnostics_stride,
+        workers=max(int(args.workers), 1),
         tire_parameters=tire_parameters,
     )
 

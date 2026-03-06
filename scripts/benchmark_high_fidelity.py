@@ -14,6 +14,18 @@ sys.path.insert(0, str(ROOT / "src"))
 from models.high_fidelity import HighFidelityTireInputs, HighFidelityTireModelParameters, HighFidelityTireSimulator, HighFidelityVehicleSimulator  # noqa: E402
 from models.physics import celsius_to_kelvin  # noqa: E402
 from models.vehicle_thermal import VehicleInputs  # noqa: E402
+
+
+BENCHMARK_CONFIG = {
+    "preset": "smoke",
+    "dt_s": 0.2,
+    "duration_scale": 0.03,
+    "lhs_samples": 4,
+    "sobol_samples": 6,
+    "seed": 2026,
+}
+
+
 def _load_run_module():
     module_path = ROOT / "scripts" / "run_high_fidelity_no_data.py"
     spec = importlib.util.spec_from_file_location("run_high_fidelity_no_data", module_path)
@@ -96,15 +108,81 @@ def _bench_harness() -> dict[str, float]:
     run_module = _load_run_module()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        start = time.perf_counter()
-        run_module.run_high_fidelity_no_data(
-            preset="smoke",
-            output_path=tmp / "hf_bench.json",
-            summary_path=tmp / "hf_bench.md",
-            dt_s=0.2,
-        )
-        duration = time.perf_counter() - start
-    return {"smoke_runtime_s": duration}
+        deterministic_runs = [
+            _run_harness_once(run_module, tmp, workers=1, suffix=f"determinism_{idx}")
+            for idx in range(2)
+        ]
+        _assert_equivalent_outputs(deterministic_runs[0], deterministic_runs[1])
+
+        serial_runs = [
+            _run_harness_once(run_module, tmp, workers=1, suffix=f"serial_{idx}")
+            for idx in range(3)
+        ]
+        parallel_runs = [
+            _run_harness_once(run_module, tmp, workers=2, suffix=f"parallel_{idx}")
+            for idx in range(3)
+        ]
+        for run in serial_runs[1:] + parallel_runs:
+            _assert_equivalent_outputs(serial_runs[0], run)
+
+    serial_median = statistics.median(run["runtime_s"] for run in serial_runs)
+    parallel_median = statistics.median(run["runtime_s"] for run in parallel_runs)
+    improvement_s = serial_median - parallel_median
+    improvement_pct = (improvement_s / serial_median) * 100.0 if serial_median > 0.0 else 0.0
+    if improvement_pct < 1.0:
+        msg = f"Expected at least 1% speedup, got {improvement_pct:.2f}%"
+        raise RuntimeError(msg)
+    return {
+        "serial_runtime_median_s": serial_median,
+        "parallel_runtime_median_s": parallel_median,
+        "improvement_s": improvement_s,
+        "improvement_pct": improvement_pct,
+    }
+
+
+def _normalize_artifact(payload: dict) -> dict:
+    normalized = json.loads(json.dumps(payload))
+    metadata = normalized.get("metadata", {})
+    for key in ("created_at_utc", "results_path", "summary_path"):
+        metadata.pop(key, None)
+    return normalized
+
+
+def _normalize_summary(text: str) -> str:
+    return "\n".join(
+        line
+        for line in text.splitlines()
+        if not line.startswith("- created_at_utc:")
+        and not line.startswith("- results_json:")
+        and not line.startswith("- summary_md:")
+    )
+
+
+def _run_harness_once(run_module, tmp: Path, *, workers: int, suffix: str) -> dict:
+    output_json = tmp / f"{suffix}.json"
+    output_summary = tmp / f"{suffix}.md"
+    start = time.perf_counter()
+    run_module.run_high_fidelity_no_data(
+        output_path=output_json,
+        summary_path=output_summary,
+        workers=workers,
+        **BENCHMARK_CONFIG,
+    )
+    runtime = time.perf_counter() - start
+    artifact = json.loads(output_json.read_text(encoding="utf-8"))
+    summary = output_summary.read_text(encoding="utf-8")
+    return {
+        "runtime_s": runtime,
+        "artifact": _normalize_artifact(artifact),
+        "summary": _normalize_summary(summary),
+    }
+
+
+def _assert_equivalent_outputs(left: dict, right: dict) -> None:
+    if left["artifact"] != right["artifact"]:
+        raise RuntimeError("Normalized artifacts differ between benchmark runs")
+    if left["summary"] != right["summary"]:
+        raise RuntimeError("Summary output differs between benchmark runs")
 
 
 def main() -> None:

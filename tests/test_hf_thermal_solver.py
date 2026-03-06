@@ -405,3 +405,4 @@ def test_p3_flash_layer_runs_hotter_than_bulk_surface_under_slip_heating() -> No
     assert state.flash_temperature_field_tw_k is not None
     assert diag.flash_surface_temperature_k is not None
     assert np.max(state.flash_temperature_field_tw_k) > float(np.mean(state.thermal_field_rtw_k[-1, :, :]))
+    assert diag.flash_surface_temperature_k - diag.surface_temperature_k > 2.0

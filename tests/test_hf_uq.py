@@ -72,8 +72,8 @@ def test_p7_sobol_ranking_identifies_dominant_parameter() -> None:
     assert result.indices[0].total_order > result.indices[1].total_order
     assert result.indices[1].total_order > result.indices[2].total_order
     for index in result.indices:
-        assert -0.05 <= index.first_order <= 1.05
-        assert -0.05 <= index.total_order <= 1.05
+        assert 0.0 <= index.first_order <= 1.0
+        assert 0.0 <= index.total_order <= 1.0
 
 
 def test_p7_lhs_screen_returns_deterministic_envelopes() -> None:

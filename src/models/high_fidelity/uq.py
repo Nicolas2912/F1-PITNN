@@ -192,6 +192,54 @@ class HighFidelityUQ:
             prior_names=prior_names,
             sample_matrix=matrix_b,
         )
+        return self.sobol_indices_from_matrices(
+            priors=priors,
+            matrix_a=matrix_a,
+            matrix_b=matrix_b,
+            y_a=y_a,
+            y_b=y_b,
+            model_fn=model_fn,
+            prior_names=prior_names,
+        )
+
+    def sobol_indices_from_matrices(
+        self,
+        *,
+        priors: list[ParameterPrior] | tuple[ParameterPrior, ...],
+        matrix_a: np.ndarray,
+        matrix_b: np.ndarray,
+        y_a: np.ndarray,
+        y_b: np.ndarray,
+        model_fn: Callable[[dict[str, float]], float],
+        prior_names: tuple[str, ...] | None = None,
+    ) -> SobolResult:
+        resolved_prior_names = tuple(prior.name for prior in priors) if prior_names is None else prior_names
+        y_ab_by_dim: list[np.ndarray] = []
+        for dim, _prior in enumerate(priors):
+            matrix_ab = matrix_a.copy()
+            matrix_ab[:, dim] = matrix_b[:, dim]
+            y_ab_by_dim.append(
+                self._evaluate_scalar_model(
+                    model_fn=model_fn,
+                    prior_names=resolved_prior_names,
+                    sample_matrix=matrix_ab,
+                )
+            )
+        return self.sobol_indices_from_evaluations(
+            priors=priors,
+            y_a=y_a,
+            y_b=y_b,
+            y_ab_by_dim=y_ab_by_dim,
+        )
+
+    def sobol_indices_from_evaluations(
+        self,
+        *,
+        priors: list[ParameterPrior] | tuple[ParameterPrior, ...],
+        y_a: np.ndarray,
+        y_b: np.ndarray,
+        y_ab_by_dim: list[np.ndarray] | tuple[np.ndarray, ...],
+    ) -> SobolResult:
         variance = float(np.var(np.concatenate((y_a, y_b)), ddof=1))
         if variance <= 1e-12:
             zero = tuple(
@@ -202,16 +250,11 @@ class HighFidelityUQ:
 
         indices: list[SobolSensitivityIndex] = []
         for dim, prior in enumerate(priors):
-            matrix_ab = matrix_a.copy()
-            matrix_ab[:, dim] = matrix_b[:, dim]
-            y_ab = self._evaluate_scalar_model(
-                model_fn=model_fn,
-                prior_names=prior_names,
-                sample_matrix=matrix_ab,
-            )
-
-            first_order = float(1.0 - np.mean((y_b - y_ab) ** 2) / (2.0 * variance))
-            total_order = float(np.mean((y_a - y_ab) ** 2) / (2.0 * variance))
+            y_ab = y_ab_by_dim[dim]
+            first_order_raw = float(np.mean(y_b * (y_ab - y_a)) / variance)
+            total_order_raw = float(np.mean((y_a - y_ab) ** 2) / (2.0 * variance))
+            first_order = float(np.clip(first_order_raw, 0.0, 1.0))
+            total_order = float(np.clip(max(total_order_raw, first_order), 0.0, 1.0))
             indices.append(
                 SobolSensitivityIndex(
                     name=prior.name,
@@ -252,46 +295,54 @@ class HighFidelityUQ:
         pressure_patch = params.pressure_patch
         surface_state = params.surface_state
         core_sensor = params.core_sensor
+        internal_coupling = params.internal_coupling
+        flash_layer = params.flash_layer
+        local_contact = params.local_contact
         return (
             ParameterPrior(
                 name="layer_stack.tread.k_r_w_per_mk",
-                lower=0.70 * params.layer_stack.tread.k_r_w_per_mk,
-                upper=1.30 * params.layer_stack.tread.k_r_w_per_mk,
+                lower=0.60 * params.layer_stack.tread.k_r_w_per_mk,
+                upper=1.45 * params.layer_stack.tread.k_r_w_per_mk,
             ),
             ParameterPrior(
                 name="layer_stack.belt.k_theta_w_per_mk",
-                lower=0.70 * params.layer_stack.belt.k_theta_w_per_mk,
-                upper=1.30 * params.layer_stack.belt.k_theta_w_per_mk,
+                lower=0.60 * params.layer_stack.belt.k_theta_w_per_mk,
+                upper=1.45 * params.layer_stack.belt.k_theta_w_per_mk,
             ),
             ParameterPrior(
                 name="layer_stack.carcass.volumetric_heat_capacity_j_per_m3k",
-                lower=0.80 * params.layer_stack.carcass.volumetric_heat_capacity_j_per_m3k,
-                upper=1.20 * params.layer_stack.carcass.volumetric_heat_capacity_j_per_m3k,
+                lower=0.70 * params.layer_stack.carcass.volumetric_heat_capacity_j_per_m3k,
+                upper=1.30 * params.layer_stack.carcass.volumetric_heat_capacity_j_per_m3k,
             ),
             ParameterPrior(
                 name="strain_amplitude_reference",
-                lower=0.75 * params.strain_amplitude_reference,
-                upper=1.25 * params.strain_amplitude_reference,
+                lower=0.65 * params.strain_amplitude_reference,
+                upper=1.45 * params.strain_amplitude_reference,
+            ),
+            ParameterPrior(
+                name="hysteresis_active_volume_m3",
+                lower=0.55 * params.hysteresis_active_volume_m3,
+                upper=1.85 * params.hysteresis_active_volume_m3,
             ),
             ParameterPrior(
                 name="force_mu_peak",
-                lower=0.80 * params.force_mu_peak,
-                upper=1.20 * params.force_mu_peak,
+                lower=0.70 * params.force_mu_peak,
+                upper=1.30 * params.force_mu_peak,
             ),
             ParameterPrior(
                 name="boundary.eta_tire",
-                lower=max(0.40, boundary.eta_tire - 0.20),
-                upper=min(0.95, boundary.eta_tire + 0.15),
+                lower=max(0.35, boundary.eta_tire - 0.25),
+                upper=min(0.98, boundary.eta_tire + 0.20),
             ),
             ParameterPrior(
                 name="boundary.h_cp_w_per_m2k",
-                lower=0.55 * boundary.h_cp_w_per_m2k,
-                upper=1.65 * boundary.h_cp_w_per_m2k,
+                lower=0.45 * boundary.h_cp_w_per_m2k,
+                upper=1.90 * boundary.h_cp_w_per_m2k,
             ),
             ParameterPrior(
                 name="boundary.h_c_bead_w_per_m2k",
-                lower=0.50 * boundary.h_c_bead_w_per_m2k,
-                upper=1.60 * boundary.h_c_bead_w_per_m2k,
+                lower=0.40 * boundary.h_c_bead_w_per_m2k,
+                upper=1.90 * boundary.h_c_bead_w_per_m2k,
             ),
             ParameterPrior(
                 name="boundary.road_thermal_conductivity_w_per_mk",
@@ -300,13 +351,13 @@ class HighFidelityUQ:
             ),
             ParameterPrior(
                 name="pressure_patch.base_volume_m3",
-                lower=0.90 * pressure_patch.base_volume_m3,
-                upper=1.08 * pressure_patch.base_volume_m3,
+                lower=0.86 * pressure_patch.base_volume_m3,
+                upper=1.12 * pressure_patch.base_volume_m3,
             ),
             ParameterPrior(
                 name="pressure_patch.carcass_support_pressure_pa",
-                lower=0.75 * pressure_patch.carcass_support_pressure_pa,
-                upper=1.25 * pressure_patch.carcass_support_pressure_pa,
+                lower=0.65 * pressure_patch.carcass_support_pressure_pa,
+                upper=1.35 * pressure_patch.carcass_support_pressure_pa,
             ),
             ParameterPrior(
                 name="pressure_patch.effective_radius_pressure_gain_m_per_bar",
@@ -320,8 +371,8 @@ class HighFidelityUQ:
             ),
             ParameterPrior(
                 name="core_sensor.response_time_s",
-                lower=0.60 * core_sensor.response_time_s,
-                upper=1.80 * core_sensor.response_time_s,
+                lower=0.50 * core_sensor.response_time_s,
+                upper=2.20 * core_sensor.response_time_s,
             ),
             ParameterPrior(
                 name="surface_state.graining_gain",
@@ -332,6 +383,36 @@ class HighFidelityUQ:
                 name="surface_state.blister_gain",
                 lower=0.70 * surface_state.blister_gain,
                 upper=1.50 * surface_state.blister_gain,
+            ),
+            ParameterPrior(
+                name="flash_layer.friction_fraction",
+                lower=max(0.18, 0.55 * flash_layer.friction_fraction),
+                upper=min(0.72, 1.35 * flash_layer.friction_fraction),
+            ),
+            ParameterPrior(
+                name="source_volumetric_fraction",
+                lower=0.45,
+                upper=0.90,
+            ),
+            ParameterPrior(
+                name="internal_coupling.brake_disc_heat_capacity_j_per_k",
+                lower=0.55 * internal_coupling.brake_disc_heat_capacity_j_per_k,
+                upper=1.75 * internal_coupling.brake_disc_heat_capacity_j_per_k,
+            ),
+            ParameterPrior(
+                name="internal_coupling.brake_to_rim_conductance_w_per_k",
+                lower=0.45 * internal_coupling.brake_to_rim_conductance_w_per_k,
+                upper=1.80 * internal_coupling.brake_to_rim_conductance_w_per_k,
+            ),
+            ParameterPrior(
+                name="internal_coupling.brake_to_tire_conductance_w_per_k",
+                lower=0.45 * internal_coupling.brake_to_tire_conductance_w_per_k,
+                upper=1.80 * internal_coupling.brake_to_tire_conductance_w_per_k,
+            ),
+            ParameterPrior(
+                name="local_contact.partition_sliding_gain",
+                lower=0.40 * local_contact.partition_sliding_gain,
+                upper=1.90 * local_contact.partition_sliding_gain,
             ),
         )
 

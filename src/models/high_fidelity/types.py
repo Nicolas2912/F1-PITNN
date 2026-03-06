@@ -20,6 +20,60 @@ class LayerMaterialParameters:
     k_theta_w_per_mk: float
     k_w_w_per_mk: float
     hysteresis_scale: float = 1.0
+    cord_angle_deg: float = 0.0
+    reinforcement_density_factor: float = 1.0
+    shoulder_conductivity_bias: float = 1.0
+    center_conductivity_bias: float = 1.0
+    bead_conductivity_bias: float = 1.0
+    temp_conductivity_sensitivity_per_k: float = 0.0
+    wear_conductivity_sensitivity: float = 0.0
+
+
+@dataclass(frozen=True)
+class InternalCouplingParameters:
+    enabled: bool = False
+    gas_inner_liner_htc_w_per_k: float = 24.0
+    gas_rim_htc_w_per_k: float = 18.0
+    cavity_rim_htc_w_per_k: float = 9.0
+    brake_disc_heat_capacity_j_per_k: float = 900.0
+    brake_disc_to_ambient_conductance_w_per_k: float = 12.0
+    brake_to_rim_conductance_w_per_k: float = 12.0
+    brake_to_tire_conductance_w_per_k: float = 7.0
+    brake_to_sidewall_conductance_w_per_k: float = 4.0
+    gas_mixing_htc_w_per_k: float = 8.0
+    gas_mixing_speed_gain_w_per_k_per_radps: float = 0.02
+    gas_mixing_pressure_gain_per_bar: float = 0.10
+    rim_cooling_speed_gain_per_radps: float = 0.0025
+    rim_cooling_wake_gain: float = 0.20
+
+
+@dataclass(frozen=True)
+class LocalContactParameters:
+    enabled: bool = False
+    fallback_to_temperature_mu: bool = True
+    adhesion_flash_weight: float = 0.35
+    sliding_flash_weight: float = 0.82
+    adhesion_temperature_peak_k: float = celsius_to_kelvin(92.0)
+    adhesion_temperature_width_k: float = 20.0
+    sliding_temperature_peak_k: float = celsius_to_kelvin(104.0)
+    sliding_temperature_width_k: float = 28.0
+    adhesion_min_fraction: float = 0.50
+    sliding_min_fraction: float = 0.38
+    pressure_mu_sensitivity: float = 0.10
+    sliding_mu_drop_fraction: float = 0.22
+    partition_sliding_gain: float = 0.10
+    partition_pressure_gain: float = 0.05
+
+
+@dataclass(frozen=True)
+class ConstructionParameters:
+    enabled: bool = False
+    shoulder_width_fraction: float = 0.28
+    bead_width_fraction: float = 0.18
+    reinforcement_hysteresis_gain: float = 0.12
+    cord_angle_hysteresis_gain: float = 0.20
+    width_hysteresis_gain: float = 0.08
+    temp_reference_k: float = celsius_to_kelvin(80.0)
 
 
 @dataclass(frozen=True)
@@ -163,13 +217,13 @@ class SurfaceStateParameters:
 @dataclass(frozen=True)
 class FlashLayerParameters:
     enabled: bool = True
-    friction_fraction: float = 0.22
-    patch_relaxation_time_s: float = 0.045
-    bulk_coupling_time_s: float = 0.16
-    ambient_cooling_time_s: float = 0.80
-    road_cooling_time_s: float = 0.035
-    areal_heat_capacity_j_per_m2k: float = 1_450.0
-    max_delta_above_bulk_k: float = 85.0
+    friction_fraction: float = 0.38
+    patch_relaxation_time_s: float = 0.080
+    bulk_coupling_time_s: float = 0.42
+    ambient_cooling_time_s: float = 1.20
+    road_cooling_time_s: float = 0.070
+    areal_heat_capacity_j_per_m2k: float = 520.0
+    max_delta_above_bulk_k: float = 140.0
 
 
 @dataclass(frozen=True)
@@ -311,6 +365,9 @@ class HighFidelityTireModelParameters:
     sidewall_strain_gain: float = 0.95
     slip_strain_gain: float = 0.30
     pressure_strain_gain: float = 0.22
+    internal_coupling: InternalCouplingParameters = field(default_factory=InternalCouplingParameters)
+    local_contact: LocalContactParameters = field(default_factory=LocalContactParameters)
+    construction: ConstructionParameters = field(default_factory=ConstructionParameters)
     boundary: HighFidelityBoundaryParameters = field(
         default_factory=HighFidelityBoundaryParameters
     )
@@ -383,6 +440,25 @@ class HighFidelityTireState:
     last_zone_tire_heat_partition: np.ndarray | None = None
     last_zone_sliding_fraction: np.ndarray | None = None
     last_zone_flash_to_bulk_delta_k: np.ndarray | None = None
+    last_effective_gas_inner_liner_htc_w_per_k: float = 0.0
+    last_effective_gas_rim_htc_w_per_k: float = 0.0
+    last_effective_cavity_rim_htc_w_per_k: float = 0.0
+    last_cavity_to_rim_heat_w: float = 0.0
+    last_gas_to_inner_liner_heat_w: float = 0.0
+    last_gas_to_rim_heat_w: float = 0.0
+    last_brake_disc_temp_k: float | None = None
+    last_brake_disc_to_rim_heat_w: float = 0.0
+    last_brake_disc_to_tire_heat_w: float = 0.0
+    last_brake_disc_to_sidewall_heat_w: float = 0.0
+    last_effective_contact_temp_k: float = 0.0
+    last_adhesion_power_w: float = 0.0
+    last_sliding_power_w: float = 0.0
+    last_contact_pressure_factor: float = 1.0
+    last_layer_conductivity_scale_by_layer: dict[str, float] = field(default_factory=dict)
+    last_layer_hysteresis_scale_by_layer: dict[str, float] = field(default_factory=dict)
+    last_heat_source_total_w: float = 0.0
+    last_heat_sink_total_w: float = 0.0
+    last_net_heat_to_tire_w: float = 0.0
     last_hysteresis_strain_by_layer: dict[str, float] = field(default_factory=dict)
     last_hysteresis_loss_modulus_by_layer_pa: dict[str, float] = field(default_factory=dict)
     last_hysteresis_power_by_layer_w: dict[str, float] = field(default_factory=dict)
@@ -447,9 +523,28 @@ class HighFidelityTireDiagnostics:
     per_zone_tire_heat_partition: tuple[float, float, float] = (0.0, 0.0, 0.0)
     per_zone_sliding_fraction: tuple[float, float, float] = (0.0, 0.0, 0.0)
     per_zone_flash_to_bulk_delta_k: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    effective_gas_inner_liner_htc_w_per_k: float = 0.0
+    effective_gas_rim_htc_w_per_k: float = 0.0
+    effective_cavity_rim_htc_w_per_k: float = 0.0
+    cavity_to_rim_heat_w: float = 0.0
+    gas_to_inner_liner_heat_w: float = 0.0
+    gas_to_rim_heat_w: float = 0.0
+    brake_disc_temperature_k: float | None = None
+    brake_disc_to_rim_heat_w: float = 0.0
+    brake_disc_to_tire_heat_w: float = 0.0
+    brake_disc_to_sidewall_heat_w: float = 0.0
+    effective_contact_temperature_k: float = 0.0
+    adhesion_power_w: float = 0.0
+    sliding_power_w: float = 0.0
+    contact_pressure_factor: float = 1.0
     hysteresis_strain_by_layer: dict[str, float] = field(default_factory=dict)
     hysteresis_loss_modulus_by_layer_pa: dict[str, float] = field(default_factory=dict)
     hysteresis_power_by_layer_w: dict[str, float] = field(default_factory=dict)
+    layer_conductivity_scale_by_layer: dict[str, float] = field(default_factory=dict)
+    layer_hysteresis_scale_by_layer: dict[str, float] = field(default_factory=dict)
+    heat_source_total_w: float = 0.0
+    heat_sink_total_w: float = 0.0
+    net_heat_to_tire_w: float = 0.0
     bulk_core_temperature_k: float | None = None
     cavity_gas_temperature_k: float | None = None
     core_temperature_compare_k: float | None = None

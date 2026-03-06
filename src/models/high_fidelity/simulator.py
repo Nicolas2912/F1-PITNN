@@ -118,6 +118,25 @@ class HighFidelityTireSimulator:
             last_zone_tire_heat_partition=zero_w.copy(),
             last_zone_sliding_fraction=zero_w.copy(),
             last_zone_flash_to_bulk_delta_k=zero_w.copy(),
+            last_effective_gas_inner_liner_htc_w_per_k=0.0,
+            last_effective_gas_rim_htc_w_per_k=0.0,
+            last_effective_cavity_rim_htc_w_per_k=0.0,
+            last_cavity_to_rim_heat_w=0.0,
+            last_gas_to_inner_liner_heat_w=0.0,
+            last_gas_to_rim_heat_w=0.0,
+            last_brake_disc_temp_k=float(ambient_temp_k),
+            last_brake_disc_to_rim_heat_w=0.0,
+            last_brake_disc_to_tire_heat_w=0.0,
+            last_brake_disc_to_sidewall_heat_w=0.0,
+            last_effective_contact_temp_k=float(ambient_temp_k),
+            last_adhesion_power_w=0.0,
+            last_sliding_power_w=0.0,
+            last_contact_pressure_factor=1.0,
+            last_layer_conductivity_scale_by_layer={},
+            last_layer_hysteresis_scale_by_layer={},
+            last_heat_source_total_w=0.0,
+            last_heat_sink_total_w=0.0,
+            last_net_heat_to_tire_w=0.0,
             last_solver_advection_time_s=None,
             last_solver_diffusion_time_s=None,
             last_solver_diffusion_iterations=None,
@@ -146,7 +165,7 @@ class HighFidelityTireSimulator:
         loss_modulus_pa = hysteresis.equivalent_loss_modulus_pa
         q_hyst_w_per_m3 = hysteresis.total_power_density_w_per_m3
         deformation = hysteresis.deformation
-        energy_source_total_w = q_hyst_w_per_m3 * max(self.parameters.hysteresis_active_volume_m3, 0.0)
+        energy_source_total_w = state.last_heat_source_total_w
         if state.thermal_field_rtw_k is not None:
             surface_temperature_k = float(np.mean(state.thermal_field_rtw_k[-1, :, :]))
             mean_temperature_k = float(np.mean(state.thermal_field_rtw_k))
@@ -196,6 +215,8 @@ class HighFidelityTireSimulator:
         zone_eta = self._tuple3(state.last_zone_tire_heat_partition)
         zone_sliding = self._tuple3(state.last_zone_sliding_fraction)
         zone_flash_to_bulk = self._tuple3(state.last_zone_flash_to_bulk_delta_k)
+        conductivity_scale = dict(state.last_layer_conductivity_scale_by_layer)
+        hysteresis_scale = dict(state.last_layer_hysteresis_scale_by_layer)
         return HighFidelityTireDiagnostics(
             core_temperature_k=state.core_temperature_k,
             core_temperature_c=state.core_temperature_c,
@@ -239,9 +260,28 @@ class HighFidelityTireSimulator:
             per_zone_tire_heat_partition=zone_eta,
             per_zone_sliding_fraction=zone_sliding,
             per_zone_flash_to_bulk_delta_k=zone_flash_to_bulk,
+            effective_gas_inner_liner_htc_w_per_k=state.last_effective_gas_inner_liner_htc_w_per_k,
+            effective_gas_rim_htc_w_per_k=state.last_effective_gas_rim_htc_w_per_k,
+            effective_cavity_rim_htc_w_per_k=state.last_effective_cavity_rim_htc_w_per_k,
+            cavity_to_rim_heat_w=state.last_cavity_to_rim_heat_w,
+            gas_to_inner_liner_heat_w=state.last_gas_to_inner_liner_heat_w,
+            gas_to_rim_heat_w=state.last_gas_to_rim_heat_w,
+            brake_disc_temperature_k=state.last_brake_disc_temp_k,
+            brake_disc_to_rim_heat_w=state.last_brake_disc_to_rim_heat_w,
+            brake_disc_to_tire_heat_w=state.last_brake_disc_to_tire_heat_w,
+            brake_disc_to_sidewall_heat_w=state.last_brake_disc_to_sidewall_heat_w,
+            effective_contact_temperature_k=state.last_effective_contact_temp_k,
+            adhesion_power_w=state.last_adhesion_power_w,
+            sliding_power_w=state.last_sliding_power_w,
+            contact_pressure_factor=state.last_contact_pressure_factor,
             hysteresis_strain_by_layer=dict(state.last_hysteresis_strain_by_layer),
             hysteresis_loss_modulus_by_layer_pa=dict(state.last_hysteresis_loss_modulus_by_layer_pa),
             hysteresis_power_by_layer_w=dict(state.last_hysteresis_power_by_layer_w),
+            layer_conductivity_scale_by_layer=conductivity_scale,
+            layer_hysteresis_scale_by_layer=hysteresis_scale,
+            heat_source_total_w=state.last_heat_source_total_w,
+            heat_sink_total_w=state.last_heat_sink_total_w,
+            net_heat_to_tire_w=state.last_net_heat_to_tire_w,
             bulk_core_temperature_k=float(np.mean(self._core_window_temperature(state.thermal_field_rtw_k))) if state.thermal_field_rtw_k is not None else state.core_temperature_k,
             cavity_gas_temperature_k=float(state.temperature_nodes_k[5]),
             core_temperature_compare_k=float(
@@ -337,6 +377,25 @@ class HighFidelityTireSimulator:
                 last_zone_tire_heat_partition=np.zeros(self.parameters.width_zones, dtype=float),
                 last_zone_sliding_fraction=self._zone_array(coupling_result.zone_sliding_fraction, width_zones=self.parameters.width_zones),
                 last_zone_flash_to_bulk_delta_k=np.zeros(self.parameters.width_zones, dtype=float),
+                last_effective_gas_inner_liner_htc_w_per_k=0.0,
+                last_effective_gas_rim_htc_w_per_k=0.0,
+                last_effective_cavity_rim_htc_w_per_k=0.0,
+                last_cavity_to_rim_heat_w=0.0,
+                last_gas_to_inner_liner_heat_w=0.0,
+                last_gas_to_rim_heat_w=0.0,
+                last_brake_disc_temp_k=state.last_brake_disc_temp_k,
+                last_brake_disc_to_rim_heat_w=0.0,
+                last_brake_disc_to_tire_heat_w=0.0,
+                last_brake_disc_to_sidewall_heat_w=0.0,
+                last_effective_contact_temp_k=coupling_result.effective_contact_temperature_k,
+                last_adhesion_power_w=coupling_result.adhesion_power_w,
+                last_sliding_power_w=coupling_result.sliding_power_w,
+                last_contact_pressure_factor=coupling_result.contact_pressure_factor,
+                last_layer_conductivity_scale_by_layer=dict(state.last_layer_conductivity_scale_by_layer),
+                last_layer_hysteresis_scale_by_layer=dict(state.last_layer_hysteresis_scale_by_layer),
+                last_heat_source_total_w=0.0,
+                last_heat_sink_total_w=0.0,
+                last_net_heat_to_tire_w=0.0,
                 last_wheel_coupling_time_s=coupling_time_s,
             )
 
@@ -410,7 +469,21 @@ class HighFidelityTireSimulator:
                 road_moisture_w=road_state.road_moisture_w,
                 asphalt_effusivity=effective_inputs.asphalt_effusivity,
                 rubbering_level=effective_inputs.rubbering_level,
+                zone_sliding_fraction=self._zone_array(coupling_result.zone_sliding_fraction, width_zones),
+                zone_contact_temp_w_k=np.full(width_zones, coupling_result.effective_contact_temperature_k, dtype=float),
+                zone_contact_pressure_factor=np.full(width_zones, coupling_result.contact_pressure_factor, dtype=float),
             )
+            if self.parameters.local_contact.enabled:
+                sliding_gain = np.clip(
+                    1.0
+                    + self.parameters.local_contact.partition_sliding_gain * self._zone_array(coupling_result.zone_sliding_fraction, width_zones)
+                    + self.parameters.local_contact.partition_pressure_gain * max(coupling_result.contact_pressure_factor - 1.0, 0.0),
+                    1.0,
+                    1.22,
+                )
+                zone_tire_eta = np.clip(zone_tire_eta * sliding_gain, 0.20, 0.985)
+                zone_friction_to_tire_w = zone_friction_power_w * zone_tire_eta
+                zone_friction_to_road_w = np.maximum(zone_friction_power_w - zone_friction_to_tire_w, 0.0)
             last_friction_to_tire_w = float(np.sum(zone_friction_to_tire_w))
             last_friction_to_road_w = float(np.sum(zone_friction_to_road_w))
         else:
@@ -457,6 +530,10 @@ class HighFidelityTireSimulator:
         )
         q_hyst_w_per_m3 = hysteresis.total_power_density_w_per_m3
         deformation = hysteresis.deformation
+        hysteresis_active_volume_m3 = self._effective_hysteresis_active_volume_m3(deformation=deformation)
+        q_hyst_effective_w_per_m3 = q_hyst_w_per_m3 * (
+            hysteresis_active_volume_m3 / max(self.parameters.hysteresis_active_volume_m3, 1e-9)
+        )
         boundary_source = self._boundary_source_field_w_per_m3(
             thermal_field_rtw_k=thermal_field_rtw,
             zone_friction_to_tire_w=zone_friction_to_tire_w,
@@ -472,7 +549,7 @@ class HighFidelityTireSimulator:
             inputs=effective_inputs,
             time_s=state.time_s,
             dt_s=dt_s,
-            volumetric_source_w_per_m3=q_hyst_w_per_m3,
+            volumetric_source_w_per_m3=q_hyst_effective_w_per_m3,
             extra_source_w_per_m3=boundary_source,
             layer_source_weights=hysteresis.power_density_by_layer_w_per_m3,
             wear=state.wear,
@@ -502,6 +579,19 @@ class HighFidelityTireSimulator:
             brake_heat_to_sidewall_w=last_brake_heat_to_sidewall_w,
             dt_s=dt_s,
         )
+        coupling_state = self._step_internal_coupling(
+            state=state,
+            inputs=effective_inputs,
+            dt_s=dt_s,
+            carcass_inner_temp_k=float(np.mean(thermal_field_rtw_next[0, :, :])),
+            rim_temp_k=float(state.temperature_nodes_k[6]),
+            brake_temp_k=float(state.temperature_nodes_k[7]),
+            brake_power_w=effective_inputs.brake_power_w,
+            brake_heat_to_tire_w=last_brake_heat_to_tire_w,
+            brake_heat_to_rim_w=last_brake_heat_to_rim_w,
+            brake_heat_to_sidewall_w=last_brake_heat_to_sidewall_w,
+            dynamic_pressure_pa=dynamic_pressure_pa,
+        )
         y_next = self._temperature_nodes_from_field(
             thermal_field_rtw_k=thermal_field_rtw_next,
             sidewall_field_tw_k=sidewall_field_tw_next,
@@ -509,19 +599,22 @@ class HighFidelityTireSimulator:
             dt_s=dt_s,
         )
         y_next[6] = self._boundary_model.step_rim_temperature(
-            rim_temp_k=float(y_next[6]),
+            rim_temp_k=float(coupling_state["rim_temp_k"]),
             ambient_temp_k=effective_inputs.ambient_temp_k,
-            heat_input_w=last_rim_conduction_w + last_brake_heat_to_rim_w,
+            heat_input_w=last_rim_conduction_w + coupling_state["brake_disc_to_rim_heat_w"] + coupling_state["gas_to_rim_heat_w"] + coupling_state["cavity_to_rim_heat_w"],
             dt_s=dt_s,
             brake_duct_cooling_factor=effective_inputs.brake_duct_cooling_factor,
             wheel_wake_factor=effective_inputs.wheel_wake_factor,
+            wheel_angular_speed_radps=effective_inputs.wheel_angular_speed_radps,
+            external_cooling_gain=coupling_state["rim_external_cooling_gain"],
         )
-        y_next[5] = self._update_gas_temperature_k(
-            current_gas_temp_k=float(state.temperature_nodes_k[5]),
-            carcass_inner_temp_k=float(np.mean(thermal_field_rtw_next[0, :, :])),
-            rim_temp_k=float(y_next[6]),
-            dynamic_pressure_pa=dynamic_pressure_pa,
-            inputs=effective_inputs,
+        y_next[5] = float(coupling_state["gas_temp_k"])
+        y_next[7] = float(coupling_state["brake_disc_temp_k"])
+        y_next[4] = self._update_core_temperature_k(
+            current_core_temp_k=float(y_next[4]),
+            thermal_field_rtw_k=thermal_field_rtw_next,
+            sidewall_field_tw_k=sidewall_field_tw_next,
+            gas_temp_k=float(y_next[5]),
             dt_s=dt_s,
         )
         road_state = self._boundary_model.step_road_slab(
@@ -540,6 +633,21 @@ class HighFidelityTireSimulator:
             friction_to_tire_w=last_friction_to_tire_w,
             zone_contact_patch_area_m2=zone_contact_patch_area_m2,
             dt_s=dt_s,
+        )
+        conductivity_scale = self._thermal_solver.layer_conductivity_scale_summary(wear=wear_next)
+        hysteresis_scale = self._materials.layer_hysteresis_scale_summary()
+        heat_source_total_w = self._heat_source_total_w(
+            hysteresis_power_density_w_per_m3=q_hyst_effective_w_per_m3,
+            deformation=deformation,
+            friction_to_tire_w=last_friction_to_tire_w,
+            brake_disc_to_tire_w=float(coupling_state["brake_disc_to_tire_heat_w"]),
+            brake_disc_to_sidewall_w=float(coupling_state["brake_disc_to_sidewall_heat_w"]),
+        )
+        heat_sink_total_w = self._heat_sink_total_w(
+            road_conduction_w=last_road_conduction_w,
+            rim_conduction_w=last_rim_conduction_w,
+            gas_to_rim_heat_w=float(coupling_state["gas_to_rim_heat_w"]),
+            cavity_to_rim_heat_w=float(coupling_state["cavity_to_rim_heat_w"]),
         )
 
         y_next = np.clip(y_next, self.parameters.minimum_temperature_k, self.parameters.maximum_temperature_k)
@@ -596,9 +704,31 @@ class HighFidelityTireSimulator:
             last_zone_tire_heat_partition=zone_tire_eta,
             last_zone_sliding_fraction=self._zone_array(coupling_result.zone_sliding_fraction, width_zones),
             last_zone_flash_to_bulk_delta_k=zone_flash_to_bulk_delta_k,
+            last_effective_gas_inner_liner_htc_w_per_k=float(coupling_state["gas_inner_liner_htc_w_per_k"]),
+            last_effective_gas_rim_htc_w_per_k=float(coupling_state["gas_rim_htc_w_per_k"]),
+            last_effective_cavity_rim_htc_w_per_k=float(coupling_state["cavity_rim_htc_w_per_k"]),
+            last_cavity_to_rim_heat_w=float(coupling_state["cavity_to_rim_heat_w"]),
+            last_gas_to_inner_liner_heat_w=float(coupling_state["gas_to_inner_heat_w"]),
+            last_gas_to_rim_heat_w=float(coupling_state["gas_to_rim_heat_w"]),
+            last_brake_disc_temp_k=float(y_next[7]),
+            last_brake_disc_to_rim_heat_w=float(coupling_state["brake_disc_to_rim_heat_w"]),
+            last_brake_disc_to_tire_heat_w=float(coupling_state["brake_disc_to_tire_heat_w"]),
+            last_brake_disc_to_sidewall_heat_w=float(coupling_state["brake_disc_to_sidewall_heat_w"]),
+            last_effective_contact_temp_k=float(coupling_result.effective_contact_temperature_k),
+            last_adhesion_power_w=float(coupling_result.adhesion_power_w),
+            last_sliding_power_w=float(coupling_result.sliding_power_w),
+            last_contact_pressure_factor=float(coupling_result.contact_pressure_factor),
+            last_layer_conductivity_scale_by_layer=conductivity_scale,
+            last_layer_hysteresis_scale_by_layer=hysteresis_scale,
+            last_heat_source_total_w=heat_source_total_w,
+            last_heat_sink_total_w=heat_sink_total_w,
+            last_net_heat_to_tire_w=heat_source_total_w - heat_sink_total_w,
             last_hysteresis_strain_by_layer=dict(hysteresis.strain_by_layer),
             last_hysteresis_loss_modulus_by_layer_pa=dict(hysteresis.loss_modulus_by_layer_pa),
-            last_hysteresis_power_by_layer_w=self._hysteresis_power_w_by_layer(hysteresis.power_density_by_layer_w_per_m3),
+            last_hysteresis_power_by_layer_w=self._hysteresis_power_w_by_layer(
+                hysteresis.power_density_by_layer_w_per_m3,
+                active_volume_m3=hysteresis_active_volume_m3,
+            ),
             last_solver_advection_time_s=solver_result.advection_time_s if self.parameters.enable_profiling else None,
             last_solver_diffusion_time_s=solver_result.diffusion_time_s if self.parameters.enable_profiling else None,
             last_solver_diffusion_iterations=solver_result.diffusion_iterations if self.parameters.enable_profiling else None,
@@ -666,6 +796,10 @@ class HighFidelityTireSimulator:
             contact_patch_width_m=0.0,
             sliding_fraction=0.0,
             effective_mu=0.0,
+            effective_contact_temperature_k=surface_temp_k,
+            adhesion_power_w=0.0,
+            sliding_power_w=0.0,
+            contact_pressure_factor=1.0,
             zone_effective_mu=np.zeros(self.parameters.width_zones, dtype=float),
             zone_friction_power_w=np.full(
                 self.parameters.width_zones,
@@ -727,8 +861,9 @@ class HighFidelityTireSimulator:
             wheel_angular_speed_radps=wheel_angular_speed_radps,
             time_s=time_s,
         )
-        patch_means = np.mean(flash_field_tw_k[np.ix_(theta_indices, width_indices)], axis=0)
-        return self._tuple3(patch_means)
+        patch_values = flash_field_tw_k[np.ix_(theta_indices, width_indices)]
+        patch_hot = np.quantile(patch_values, 0.90, axis=0)
+        return self._tuple3(patch_hot)
 
     def _per_width_patch_surface_temp_k(
         self,
@@ -850,11 +985,18 @@ class HighFidelityTireSimulator:
             wheel_angular_speed_radps=wheel_angular_speed_radps,
             time_s=time_s,
         )
+        radial_cells = thermal_field_rtw_k.shape[0]
+        deep_start = max(int(round(0.48 * (radial_cells - 1))), 0)
+        bulk_radial_indices = np.arange(deep_start, radial_cells, dtype=int)
+        radial_positions = np.linspace(0.0, 1.0, bulk_radial_indices.shape[0], dtype=float)
+        radial_weights = 0.15 + 0.85 * radial_positions**1.4
+        radial_weights /= max(float(np.sum(radial_weights)), 1e-12)
         for zone_idx, width_idx in enumerate(width_indices):
-            patch_index = np.ix_(radial_indices, theta_indices, np.array([width_idx], dtype=int))
-            patch_volume = float(np.sum(cell_volumes[patch_index]))
             patch_power_w = bulk_fraction * zone_friction_to_tire_w[zone_idx] - road_conduction_w_by_zone[zone_idx]
-            source[patch_index] += patch_power_w / max(patch_volume, 1e-12)
+            for local_idx, radial_idx in enumerate(bulk_radial_indices):
+                patch_index = np.ix_(np.array([radial_idx], dtype=int), theta_indices, np.array([width_idx], dtype=int))
+                patch_volume = float(np.sum(cell_volumes[patch_index]))
+                source[patch_index] += patch_power_w * radial_weights[local_idx] / max(patch_volume, 1e-12)
         inner_ring_volume = float(np.sum(cell_volumes[0, :, :]))
         source[0, :, :] += (brake_heat_to_tire_w - rim_conduction_w) / max(inner_ring_volume, 1e-12)
         return source
@@ -869,12 +1011,52 @@ class HighFidelityTireSimulator:
             return np.full(width_zones, float(arr[0]), dtype=float)
         return np.resize(arr, width_zones).astype(float, copy=True)
 
-    def _hysteresis_power_w_by_layer(self, power_density_by_layer_w_per_m3: dict[str, float]) -> dict[str, float]:
-        active_volume_m3 = max(self.parameters.hysteresis_active_volume_m3, 0.0)
+    def _hysteresis_power_w_by_layer(
+        self,
+        power_density_by_layer_w_per_m3: dict[str, float],
+        *,
+        active_volume_m3: float | None = None,
+    ) -> dict[str, float]:
+        active_volume = max(self.parameters.hysteresis_active_volume_m3 if active_volume_m3 is None else active_volume_m3, 0.0)
         return {
-            name: active_volume_m3 * max(power_density, 0.0)
+            name: active_volume * max(power_density, 0.0)
             for name, power_density in power_density_by_layer_w_per_m3.items()
         }
+
+    def _effective_hysteresis_active_volume_m3(self, *, deformation) -> float:
+        base_volume = max(self.parameters.hysteresis_active_volume_m3, 0.0)
+        stack = self.parameters.layer_stack
+        effective_depth = (
+            stack.tread.thickness_m
+            + 0.85 * stack.belt.thickness_m
+            + 0.35 * stack.carcass.thickness_m
+        )
+        geometric_patch_volume = deformation.contact_patch_length_m * deformation.contact_patch_width_m * effective_depth
+        strain_gain = max(deformation.equivalent_strain_amplitude / max(self.parameters.strain_amplitude_reference, 1e-6), 0.5)
+        cyclic_factor = 1.25 + 0.55 * min(strain_gain, 2.5)
+        return float(max(base_volume, geometric_patch_volume * cyclic_factor))
+
+    def _heat_source_total_w(
+        self,
+        *,
+        hysteresis_power_density_w_per_m3: float,
+        deformation,
+        friction_to_tire_w: float,
+        brake_disc_to_tire_w: float,
+        brake_disc_to_sidewall_w: float,
+    ) -> float:
+        hysteresis_w = hysteresis_power_density_w_per_m3 * max(self.parameters.hysteresis_active_volume_m3, 1e-9)
+        return float(max(hysteresis_w, 0.0) + max(friction_to_tire_w, 0.0) + max(brake_disc_to_tire_w, 0.0) + max(brake_disc_to_sidewall_w, 0.0))
+
+    def _heat_sink_total_w(
+        self,
+        *,
+        road_conduction_w: float,
+        rim_conduction_w: float,
+        gas_to_rim_heat_w: float,
+        cavity_to_rim_heat_w: float,
+    ) -> float:
+        return float(max(rim_conduction_w, 0.0) + max(gas_to_rim_heat_w, 0.0) + max(cavity_to_rim_heat_w, 0.0) - min(road_conduction_w, 0.0))
 
     def _step_flash_field(
         self,
@@ -910,7 +1092,7 @@ class HighFidelityTireSimulator:
             q_patch_flux_w_per_m2 = q_flash_zone / zone_patch_area_m2
             min_flash_excess_k = 0.0
             if q_flash_zone > 0.0:
-                min_flash_excess_k = 0.4 + 6.0 * min(q_patch_flux_w_per_m2 / 180_000.0, 1.0)
+                min_flash_excess_k = 1.5 + 20.0 * min(q_patch_flux_w_per_m2 / 120_000.0, 1.5)
             for theta_idx in range(self.parameters.theta_cells):
                 area_m2 = max(float(surface_cell_areas[theta_idx, width_idx]), 1e-9)
                 temp_k = float(next_field[theta_idx, width_idx])
@@ -919,12 +1101,14 @@ class HighFidelityTireSimulator:
                 q_ambient = area_m2 * (ambient_temp_k - temp_k) / max(params.ambient_cooling_time_s, 1e-6)
                 q_patch = 0.0
                 q_road = 0.0
+                q_relax = area_m2 * (bulk_temp_k - temp_k) / max(params.patch_relaxation_time_s, 1e-6)
                 if theta_idx in patch_theta_set:
                     q_patch = q_flash_zone * area_m2 / zone_patch_area_m2
                     q_road = area_m2 * (
                         float(road_state.road_surface_temp_w_k[width_idx]) - temp_k
                     ) / max(params.road_cooling_time_s, 1e-6)
-                delta_k = dt_s * (q_patch + q_bulk + q_ambient + q_road) / max(
+                    q_relax *= 0.35
+                delta_k = dt_s * (q_patch + q_bulk + q_ambient + q_road + q_relax) / max(
                     params.areal_heat_capacity_j_per_m2k * area_m2,
                     1e-9,
                 )
@@ -987,6 +1171,121 @@ class HighFidelityTireSimulator:
         q_pdv = dynamic_pressure_pa * inputs.volume_change_rate_m3ps
         delta = dt_s * (q_carcass + q_rim - q_pdv) / max(gas_mass * pp.gas_cv_j_per_kgk, 1.0)
         return float(current_gas_temp_k + delta)
+
+    def _step_internal_coupling(
+        self,
+        *,
+        state: HighFidelityTireState,
+        inputs: HighFidelityTireInputs,
+        dt_s: float,
+        carcass_inner_temp_k: float,
+        rim_temp_k: float,
+        brake_temp_k: float,
+        brake_power_w: float,
+        brake_heat_to_tire_w: float,
+        brake_heat_to_rim_w: float,
+        brake_heat_to_sidewall_w: float,
+        dynamic_pressure_pa: float,
+    ) -> dict[str, float]:
+        current_gas_temp_k = float(state.temperature_nodes_k[5])
+        if not self.parameters.internal_coupling.enabled:
+            return {
+                "gas_temp_k": self._update_gas_temperature_k(
+                    current_gas_temp_k=current_gas_temp_k,
+                    carcass_inner_temp_k=carcass_inner_temp_k,
+                    rim_temp_k=rim_temp_k,
+                    dynamic_pressure_pa=dynamic_pressure_pa,
+                    inputs=inputs,
+                    dt_s=dt_s,
+                ),
+                "rim_temp_k": rim_temp_k,
+                "brake_disc_temp_k": brake_temp_k,
+                "gas_inner_liner_htc_w_per_k": 24.0,
+                "gas_rim_htc_w_per_k": 18.0,
+                "cavity_rim_htc_w_per_k": 0.0,
+                "gas_to_inner_heat_w": 24.0 * (carcass_inner_temp_k - current_gas_temp_k),
+                "gas_to_rim_heat_w": 18.0 * (rim_temp_k - current_gas_temp_k),
+                "cavity_to_rim_heat_w": 0.0,
+                "brake_disc_to_rim_heat_w": brake_heat_to_rim_w,
+                "brake_disc_to_tire_heat_w": brake_heat_to_tire_w,
+                "brake_disc_to_sidewall_heat_w": brake_heat_to_sidewall_w,
+                "rim_external_cooling_gain": 1.0,
+            }
+
+        coupling = self.parameters.internal_coupling
+        pp = self.parameters.pressure_patch
+        gas_mass = pp.resolved_gas_mass_kg()
+        gauge_bar = max((dynamic_pressure_pa - pp.atmospheric_pressure_pa) / 100_000.0, 0.2)
+        speed_scale = abs(inputs.wheel_angular_speed_radps)
+        pressure_gain = 1.0 + coupling.gas_mixing_pressure_gain_per_bar * max(gauge_bar - 1.0, -0.5)
+        gas_inner_htc = coupling.gas_inner_liner_htc_w_per_k * pressure_gain * (
+            1.0 + coupling.gas_mixing_speed_gain_w_per_k_per_radps * speed_scale
+        )
+        gas_rim_htc = coupling.gas_rim_htc_w_per_k * pressure_gain * (
+            1.0 + 0.5 * coupling.gas_mixing_speed_gain_w_per_k_per_radps * speed_scale
+        )
+        cavity_rim_htc = coupling.cavity_rim_htc_w_per_k * pressure_gain * (
+            1.0 + 0.35 * coupling.gas_mixing_speed_gain_w_per_k_per_radps * speed_scale
+        )
+        gas_mixing_htc = coupling.gas_mixing_htc_w_per_k * pressure_gain * (
+            1.0 + coupling.gas_mixing_speed_gain_w_per_k_per_radps * speed_scale
+        )
+
+        gas_to_inner_heat_w = gas_inner_htc * (carcass_inner_temp_k - current_gas_temp_k)
+        gas_to_rim_heat_w = gas_rim_htc * (rim_temp_k - current_gas_temp_k)
+        cavity_to_rim_heat_w = cavity_rim_htc * (current_gas_temp_k - rim_temp_k)
+        q_pdv = dynamic_pressure_pa * inputs.volume_change_rate_m3ps
+        gas_delta = dt_s * (gas_to_inner_heat_w + gas_to_rim_heat_w - cavity_to_rim_heat_w - q_pdv) / max(
+            gas_mass * pp.gas_cv_j_per_kgk,
+            1.0,
+        )
+        gas_temp_k = current_gas_temp_k + gas_delta
+
+        brake_disc_temp_k = brake_temp_k
+        brake_disc_temp_k += dt_s * max(brake_power_w, 0.0) / max(coupling.brake_disc_heat_capacity_j_per_k, 1.0)
+        brake_disc_to_rim_heat_w = brake_heat_to_rim_w + coupling.brake_to_rim_conductance_w_per_k * max(brake_disc_temp_k - rim_temp_k, 0.0)
+        brake_disc_to_tire_heat_w = brake_heat_to_tire_w + coupling.brake_to_tire_conductance_w_per_k * max(
+            brake_disc_temp_k - carcass_inner_temp_k,
+            0.0,
+        )
+        brake_disc_to_sidewall_heat_w = brake_heat_to_sidewall_w + coupling.brake_to_sidewall_conductance_w_per_k * max(
+            brake_disc_temp_k - float(state.temperature_nodes_k[8]),
+            0.0,
+        )
+        brake_disc_to_ambient_w = coupling.brake_disc_to_ambient_conductance_w_per_k * max(
+            brake_disc_temp_k - inputs.ambient_temp_k,
+            0.0,
+        )
+        brake_disc_out_w = (
+            brake_disc_to_rim_heat_w
+            + brake_disc_to_tire_heat_w
+            + brake_disc_to_sidewall_heat_w
+            + brake_disc_to_ambient_w
+        )
+        brake_disc_temp_k -= dt_s * brake_disc_out_w / max(coupling.brake_disc_heat_capacity_j_per_k, 1.0)
+        rim_external_cooling_gain = (
+            1.0
+            + coupling.rim_cooling_speed_gain_per_radps * speed_scale
+            + coupling.rim_cooling_wake_gain * max(inputs.wheel_wake_factor - 1.0, -0.8)
+        )
+        rim_temp_with_cavity_k = rim_temp_k + dt_s * (
+            brake_disc_to_rim_heat_w + gas_to_rim_heat_w + cavity_to_rim_heat_w + gas_mixing_htc * (gas_temp_k - rim_temp_k)
+        ) / max(self.parameters.boundary.rim_heat_capacity_j_per_k, 1.0)
+        return {
+            "gas_temp_k": float(gas_temp_k),
+            "rim_temp_k": float(rim_temp_with_cavity_k),
+            "brake_disc_temp_k": float(brake_disc_temp_k),
+            "gas_inner_liner_htc_w_per_k": float(gas_inner_htc),
+            "gas_rim_htc_w_per_k": float(gas_rim_htc),
+            "cavity_rim_htc_w_per_k": float(cavity_rim_htc),
+            "gas_to_inner_heat_w": float(gas_to_inner_heat_w),
+            "gas_to_rim_heat_w": float(gas_to_rim_heat_w),
+            "cavity_to_rim_heat_w": float(cavity_to_rim_heat_w),
+            "brake_disc_to_rim_heat_w": float(brake_disc_to_rim_heat_w),
+            "brake_disc_to_tire_heat_w": float(brake_disc_to_tire_heat_w),
+            "brake_disc_to_sidewall_heat_w": float(brake_disc_to_sidewall_heat_w),
+            "rim_external_cooling_gain": float(max(rim_external_cooling_gain, 0.2)),
+        }
 
     def _update_surface_state(
         self,

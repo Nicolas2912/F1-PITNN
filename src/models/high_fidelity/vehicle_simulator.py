@@ -48,6 +48,18 @@ class HighFidelityVehicleDiagnostics:
     right_minus_left_load_n: float
 
 
+@dataclass(frozen=True)
+class PreparedVehicleInputs:
+    inputs: VehicleInputs
+    wheel_load_n: dict[WheelId, float]
+    wheel_speed_mps: dict[WheelId, float]
+    wheel_slip_ratio_cmd: dict[WheelId, float]
+    wheel_slip_angle_cmd_rad: dict[WheelId, float]
+    wheel_drive_torque_nm: dict[WheelId, float]
+    wheel_brake_torque_nm: dict[WheelId, float]
+    total_vertical_force_n: float
+
+
 class HighFidelityVehicleSimulator:
     def __init__(
         self,
@@ -84,29 +96,25 @@ class HighFidelityVehicleSimulator:
         state: HighFidelityVehicleState,
         inputs: VehicleInputs,
         dt_s: float,
+        prepared_inputs: PreparedVehicleInputs | None = None,
     ) -> HighFidelityVehicleState:
         if dt_s <= 0.0:
             msg = f"dt_s must be positive, got {dt_s}"
             raise ValueError(msg)
 
-        wheel_loads = self._wheel_vertical_loads(inputs)
-        wheel_slip_ratio = self._wheel_slip_ratio_commands(inputs, wheel_loads)
-        wheel_slip_angle = self._wheel_slip_angle_commands(inputs)
-        wheel_speed = self._wheel_longitudinal_speeds(inputs)
-        wheel_drive_torque = self._wheel_drive_torque(inputs, wheel_speed, wheel_slip_ratio)
-        wheel_brake_torque = self._wheel_brake_torque(inputs, wheel_speed, wheel_slip_ratio)
+        resolved = self.prepare_inputs(inputs) if prepared_inputs is None else prepared_inputs
 
         next_wheel_states: dict[WheelId, HighFidelityTireState] = {}
         for wheel in WHEEL_IDS:
             tire_inputs = self._tire_inputs_for_wheel(
                 wheel=wheel,
                 inputs=inputs,
-                wheel_speed_mps=wheel_speed[wheel],
-                normal_load_n=wheel_loads[wheel],
-                slip_ratio_cmd=wheel_slip_ratio[wheel],
-                slip_angle_cmd_rad=wheel_slip_angle[wheel],
-                drive_torque_nm=wheel_drive_torque[wheel],
-                brake_torque_nm=wheel_brake_torque[wheel],
+                wheel_speed_mps=resolved.wheel_speed_mps[wheel],
+                normal_load_n=resolved.wheel_load_n[wheel],
+                slip_ratio_cmd=resolved.wheel_slip_ratio_cmd[wheel],
+                slip_angle_cmd_rad=resolved.wheel_slip_angle_cmd_rad[wheel],
+                drive_torque_nm=resolved.wheel_drive_torque_nm[wheel],
+                brake_torque_nm=resolved.wheel_brake_torque_nm[wheel],
             )
             next_wheel_states[wheel] = self._tire_simulators[wheel].step(
                 state.wheel_states[wheel],
@@ -132,13 +140,9 @@ class HighFidelityVehicleSimulator:
         self,
         state: HighFidelityVehicleState,
         inputs: VehicleInputs,
+        prepared_inputs: PreparedVehicleInputs | None = None,
     ) -> HighFidelityVehicleDiagnostics:
-        wheel_loads = self._wheel_vertical_loads(inputs)
-        wheel_slip_ratio = self._wheel_slip_ratio_commands(inputs, wheel_loads)
-        wheel_slip_angle = self._wheel_slip_angle_commands(inputs)
-        wheel_speed = self._wheel_longitudinal_speeds(inputs)
-        wheel_drive_torque = self._wheel_drive_torque(inputs, wheel_speed, wheel_slip_ratio)
-        wheel_brake_torque = self._wheel_brake_torque(inputs, wheel_speed, wheel_slip_ratio)
+        resolved = self.prepare_inputs(inputs) if prepared_inputs is None else prepared_inputs
 
         tire_diags: dict[WheelId, HighFidelityTireDiagnostics] = {}
         wheel_core_temp: dict[WheelId, float] = {}
@@ -150,12 +154,12 @@ class HighFidelityVehicleSimulator:
             tire_inputs = self._tire_inputs_for_wheel(
                 wheel=wheel,
                 inputs=inputs,
-                wheel_speed_mps=wheel_speed[wheel],
-                normal_load_n=wheel_loads[wheel],
-                slip_ratio_cmd=wheel_slip_ratio[wheel],
-                slip_angle_cmd_rad=wheel_slip_angle[wheel],
-                drive_torque_nm=wheel_drive_torque[wheel],
-                brake_torque_nm=wheel_brake_torque[wheel],
+                wheel_speed_mps=resolved.wheel_speed_mps[wheel],
+                normal_load_n=resolved.wheel_load_n[wheel],
+                slip_ratio_cmd=resolved.wheel_slip_ratio_cmd[wheel],
+                slip_angle_cmd_rad=resolved.wheel_slip_angle_cmd_rad[wheel],
+                drive_torque_nm=resolved.wheel_drive_torque_nm[wheel],
+                brake_torque_nm=resolved.wheel_brake_torque_nm[wheel],
             )
             diag = self._tire_simulators[wheel].diagnostics(state.wheel_states[wheel], tire_inputs)
             tire_diags[wheel] = diag
@@ -165,19 +169,23 @@ class HighFidelityVehicleSimulator:
             wheel_effective_slip_angle[wheel] = diag.effective_slip_angle_rad
             wheel_coupling_converged[wheel] = diag.coupling_converged
 
-        total_vertical_force_n = self._total_vertical_force(inputs)
-        load_sum = sum(wheel_loads.values())
+        total_vertical_force_n = resolved.total_vertical_force_n
+        load_sum = sum(resolved.wheel_load_n.values())
         load_error_pct = abs(load_sum - total_vertical_force_n) / max(total_vertical_force_n, 1.0) * 100.0
-        front_axle = wheel_loads["FL"] + wheel_loads["FR"]
-        rear_axle = wheel_loads["RL"] + wheel_loads["RR"]
-        right_minus_left = (wheel_loads["FR"] + wheel_loads["RR"]) - (wheel_loads["FL"] + wheel_loads["RL"])
+        front_axle = resolved.wheel_load_n["FL"] + resolved.wheel_load_n["FR"]
+        rear_axle = resolved.wheel_load_n["RL"] + resolved.wheel_load_n["RR"]
+        right_minus_left = (
+            resolved.wheel_load_n["FR"] + resolved.wheel_load_n["RR"]
+        ) - (
+            resolved.wheel_load_n["FL"] + resolved.wheel_load_n["RL"]
+        )
         return HighFidelityVehicleDiagnostics(
-            wheel_load_n=wheel_loads,
-            wheel_speed_mps=wheel_speed,
-            wheel_slip_ratio_cmd=wheel_slip_ratio,
-            wheel_slip_angle_cmd_rad=wheel_slip_angle,
-            wheel_drive_torque_nm=wheel_drive_torque,
-            wheel_brake_torque_nm=wheel_brake_torque,
+            wheel_load_n=resolved.wheel_load_n,
+            wheel_speed_mps=resolved.wheel_speed_mps,
+            wheel_slip_ratio_cmd=resolved.wheel_slip_ratio_cmd,
+            wheel_slip_angle_cmd_rad=resolved.wheel_slip_angle_cmd_rad,
+            wheel_drive_torque_nm=resolved.wheel_drive_torque_nm,
+            wheel_brake_torque_nm=resolved.wheel_brake_torque_nm,
             wheel_core_temp_c=wheel_core_temp,
             wheel_surface_temp_c=wheel_surface_temp,
             wheel_effective_slip_ratio=wheel_effective_slip_ratio,
@@ -189,6 +197,33 @@ class HighFidelityVehicleSimulator:
             front_axle_load_n=front_axle,
             rear_axle_load_n=rear_axle,
             right_minus_left_load_n=right_minus_left,
+        )
+
+    def prepare_inputs(self, inputs: VehicleInputs) -> PreparedVehicleInputs:
+        wheel_speed = self._wheel_longitudinal_speeds(inputs)
+        total_vertical_force = self._total_vertical_force(inputs)
+        wheel_loads = self._wheel_vertical_loads(inputs, total_vertical_force_n=total_vertical_force)
+        wheel_drive_torque = self._wheel_drive_torque(inputs, wheel_speed, None)
+        wheel_brake_torque = self._wheel_brake_torque(inputs, wheel_speed, None)
+        wheel_slip_ratio = self._wheel_slip_ratio_commands(
+            inputs,
+            wheel_loads,
+            wheel_speed_mps=wheel_speed,
+            wheel_drive_torque_nm=wheel_drive_torque,
+            wheel_brake_torque_nm=wheel_brake_torque,
+        )
+        wheel_drive_torque = self._wheel_drive_torque(inputs, wheel_speed, wheel_slip_ratio)
+        wheel_brake_torque = self._wheel_brake_torque(inputs, wheel_speed, wheel_slip_ratio)
+        wheel_slip_angle = self._wheel_slip_angle_commands(inputs)
+        return PreparedVehicleInputs(
+            inputs=inputs,
+            wheel_load_n=wheel_loads,
+            wheel_speed_mps=wheel_speed,
+            wheel_slip_ratio_cmd=wheel_slip_ratio,
+            wheel_slip_angle_cmd_rad=wheel_slip_angle,
+            wheel_drive_torque_nm=wheel_drive_torque,
+            wheel_brake_torque_nm=wheel_brake_torque,
+            total_vertical_force_n=total_vertical_force,
         )
 
     def _tire_inputs_for_wheel(
@@ -249,9 +284,13 @@ class HighFidelityVehicleSimulator:
             is_front_tire=wheel in ("FL", "FR"),
         )
 
-    def _wheel_vertical_loads(self, inputs: VehicleInputs) -> dict[WheelId, float]:
+    def _wheel_vertical_loads(
+        self,
+        inputs: VehicleInputs,
+        total_vertical_force_n: float | None = None,
+    ) -> dict[WheelId, float]:
         p = self.parameters
-        total_vertical_force = self._total_vertical_force(inputs)
+        total_vertical_force = self._total_vertical_force(inputs) if total_vertical_force_n is None else total_vertical_force_n
         downforce = p.aero_downforce_coeff_n_per_mps2 * max(inputs.speed_mps, 0.0) ** 2
         static_front = p.mass_kg * p.gravity_mps2 * p.front_static_weight_fraction + downforce * p.aero_front_fraction
         static_rear = total_vertical_force - static_front
@@ -301,14 +340,25 @@ class HighFidelityVehicleSimulator:
         self,
         inputs: VehicleInputs,
         wheel_load_n: Mapping[WheelId, float],
+        wheel_speed_mps: Mapping[WheelId, float] | None = None,
+        wheel_drive_torque_nm: Mapping[WheelId, float] | None = None,
+        wheel_brake_torque_nm: Mapping[WheelId, float] | None = None,
     ) -> dict[WheelId, float]:
         p = self.parameters
-        wheel_speed_mps = self._wheel_longitudinal_speeds(inputs)
-        wheel_drive_torque = self._wheel_drive_torque(inputs, wheel_speed_mps, None)
-        wheel_brake_torque = self._wheel_brake_torque(inputs, wheel_speed_mps, None)
+        resolved_wheel_speed = self._wheel_longitudinal_speeds(inputs) if wheel_speed_mps is None else wheel_speed_mps
+        wheel_drive_torque = (
+            self._wheel_drive_torque(inputs, resolved_wheel_speed, None)
+            if wheel_drive_torque_nm is None
+            else wheel_drive_torque_nm
+        )
+        wheel_brake_torque = (
+            self._wheel_brake_torque(inputs, resolved_wheel_speed, None)
+            if wheel_brake_torque_nm is None
+            else wheel_brake_torque_nm
+        )
         slip_commands: dict[WheelId, float] = {}
         for wheel in WHEEL_IDS:
-            speed_abs = abs(wheel_speed_mps[wheel])
+            speed_abs = abs(resolved_wheel_speed[wheel])
             net_torque_nm = wheel_drive_torque[wheel] - wheel_brake_torque[wheel]
             power_based_force = net_torque_nm / max(p.wheel_radius_m, 1e-6)
             mu_demand = power_based_force / max(abs(wheel_load_n[wheel]), p.min_wheel_load_n)
@@ -322,7 +372,7 @@ class HighFidelityVehicleSimulator:
                 continue
 
             omega = inputs.wheel_angular_speed_radps.get(wheel, 0.0)
-            kappa_from_speed = (omega * p.wheel_radius_m - wheel_speed_mps[wheel]) / max(speed_abs, 1.0)
+            kappa_from_speed = (omega * p.wheel_radius_m - resolved_wheel_speed[wheel]) / max(speed_abs, 1.0)
             blend = speed_abs / (speed_abs + max(p.slip_blend_speed_mps, 1e-3))
             slip_commands[wheel] = blend * kappa_from_speed + (1.0 - blend) * kappa_from_power
         return slip_commands

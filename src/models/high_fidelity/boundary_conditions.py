@@ -138,18 +138,27 @@ class BoundaryConditionModel:
         road_moisture_w: np.ndarray,
         asphalt_effusivity: float = 1.0,
         rubbering_level: float = 0.0,
+        zone_sliding_fraction: np.ndarray | None = None,
+        zone_contact_temp_w_k: np.ndarray | None = None,
+        zone_contact_pressure_factor: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         zone_friction = np.asarray(zone_friction_power_w, dtype=float)
         flash_temp = np.asarray(flash_temp_w_k, dtype=float)
         bulk_temp = np.asarray(bulk_temp_w_k, dtype=float)
         road_temp = np.asarray(road_surface_temp_w_k, dtype=float)
         moisture = np.asarray(road_moisture_w, dtype=float)
+        sliding_fraction = np.zeros_like(zone_friction, dtype=float) if zone_sliding_fraction is None else np.asarray(zone_sliding_fraction, dtype=float)
+        contact_temp = np.asarray(bulk_temp, dtype=float) if zone_contact_temp_w_k is None else np.asarray(zone_contact_temp_w_k, dtype=float)
+        pressure_factor = np.ones_like(zone_friction, dtype=float) if zone_contact_pressure_factor is None else np.asarray(zone_contact_pressure_factor, dtype=float)
         if not (
             zone_friction.shape
             == flash_temp.shape
             == bulk_temp.shape
             == road_temp.shape
             == moisture.shape
+            == sliding_fraction.shape
+            == contact_temp.shape
+            == pressure_factor.shape
         ):
             msg = "Zone-local partition inputs must have matching shapes"
             raise ValueError(msg)
@@ -166,6 +175,9 @@ class BoundaryConditionModel:
             eta -= 0.15 * np.clip(float(moisture[idx]), 0.0, 1.0)
             eta += self.parameters.effusivity_eta_gain * (asphalt_effusivity - 1.0)
             eta += 0.04 * np.clip(rubbering_level, 0.0, 1.0)
+            eta += 0.08 * np.clip(float(sliding_fraction[idx]), 0.0, 1.0)
+            eta += 0.0006 * max(float(contact_temp[idx]) - float(bulk_temp[idx]), 0.0)
+            eta += 0.05 * (float(pressure_factor[idx]) - 1.0)
             eta = float(np.clip(eta, 0.20, 0.98))
             power = max(float(zone_friction[idx]), 0.0)
             eta_w[idx] = eta
@@ -315,6 +327,8 @@ class BoundaryConditionModel:
         dt_s: float,
         brake_duct_cooling_factor: float = 1.0,
         wheel_wake_factor: float = 1.0,
+        wheel_angular_speed_radps: float = 0.0,
+        external_cooling_gain: float = 1.0,
     ) -> float:
         c_rim = max(self.parameters.rim_heat_capacity_j_per_k, 1e-6)
         g_rim_amb = max(self.parameters.rim_to_ambient_conductance_w_per_k, 0.0)
@@ -323,7 +337,8 @@ class BoundaryConditionModel:
             + 0.25 * max(brake_duct_cooling_factor - 1.0, -0.8)
             + 0.20 * max(wheel_wake_factor - 1.0, -0.8)
         )
-        q_amb = g_rim_amb * cooling_gain * (rim_temp_k - ambient_temp_k)
+        speed_gain = 1.0 + 0.02 * min(max(abs(wheel_angular_speed_radps), 0.0) / 200.0, 2.5)
+        q_amb = g_rim_amb * cooling_gain * speed_gain * max(external_cooling_gain, 0.2) * (rim_temp_k - ambient_temp_k)
         return float(rim_temp_k + dt_s * (heat_input_w - q_amb) / c_rim)
 
     def _effective_mu(

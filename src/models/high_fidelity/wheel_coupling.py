@@ -24,6 +24,10 @@ class WheelCouplingResult:
     contact_patch_width_m: float
     sliding_fraction: float
     effective_mu: float
+    effective_contact_temperature_k: float = 0.0
+    adhesion_power_w: float = 0.0
+    sliding_power_w: float = 0.0
+    contact_pressure_factor: float = 1.0
     zone_effective_mu: np.ndarray | None = None
     zone_friction_power_w: np.ndarray | None = None
     zone_sliding_fraction: np.ndarray | None = None
@@ -38,6 +42,10 @@ class _PatchResponse:
     contact_patch_width_m: float
     sliding_fraction: float
     effective_mu: float
+    effective_contact_temperature_k: float
+    adhesion_power_w: float
+    sliding_power_w: float
+    contact_pressure_factor: float
     zone_effective_mu: np.ndarray
     zone_friction_power_w: np.ndarray
     zone_sliding_fraction: np.ndarray
@@ -131,6 +139,10 @@ class WheelForceCouplingModel:
                 contact_patch_width_m=response.contact_patch_width_m,
                 sliding_fraction=response.sliding_fraction,
                 effective_mu=response.effective_mu,
+                effective_contact_temperature_k=response.effective_contact_temperature_k,
+                adhesion_power_w=response.adhesion_power_w,
+                sliding_power_w=response.sliding_power_w,
+                contact_pressure_factor=response.contact_pressure_factor,
                 zone_effective_mu=np.array(response.zone_effective_mu, dtype=float, copy=True),
                 zone_friction_power_w=np.array(response.zone_friction_power_w, dtype=float, copy=True),
                 zone_sliding_fraction=np.array(response.zone_sliding_fraction, dtype=float, copy=True),
@@ -208,7 +220,22 @@ class WheelForceCouplingModel:
         normal_load_n = max(normal_load_n, 0.0)
         if normal_load_n <= 0.0:
             zeros = np.zeros(3, dtype=float)
-            return _PatchResponse(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, zeros, zeros, zeros)
+            return _PatchResponse(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                zeros,
+                zeros,
+                zeros,
+            )
 
         if not params.use_reduced_patch_mechanics:
             return self._evaluate_legacy_response(
@@ -241,10 +268,19 @@ class WheelForceCouplingModel:
         contact_time_s = patch_length_m / max(speed_abs, 3.0)
         local_vx = np.broadcast_to(speed_abs * slip_ratio * self._lead_trail_gain, pressure_grid.shape)
         local_vy = np.broadcast_to(speed_abs * tan_alpha * self._lateral_speed_shape, pressure_grid.shape)
-        if params.use_local_temp_friction_partition:
-            effective_temp_k = self._mixed_contact_temperature_grid_k(
+        if params.local_contact.enabled:
+            effective_temp_k = self._local_contact_temperature_grid_k(
                 bulk_profile_k=bulk_profile_k,
                 flash_profile_k=flash_profile_k,
+            )
+            mu_peak, mu_slide = self._local_friction_coefficients(
+                normal_load_n=normal_load_n,
+                contact_pressure_pa=pressure_grid,
+                bulk_profile_k=bulk_profile_k,
+                flash_profile_k=flash_profile_k,
+                road_moisture=road_moisture,
+                rubbering_level=rubbering_level,
+                asphalt_roughness=asphalt_roughness,
             )
         else:
             mean_temp_k = self._mixed_contact_temperature_k(
@@ -252,15 +288,18 @@ class WheelForceCouplingModel:
                 flash_temp_k=float(np.mean(flash_profile_k)),
             )
             effective_temp_k = np.full_like(pressure_grid, mean_temp_k, dtype=float)
-        mu_peak = self._friction_coefficient_grid(
-            normal_load_n=normal_load_n,
-            surface_temp_k=effective_temp_k,
-            road_moisture=road_moisture,
-            rubbering_level=rubbering_level,
-            asphalt_roughness=asphalt_roughness,
-        )
+            mu_peak = self._friction_coefficient_grid(
+                normal_load_n=normal_load_n,
+                surface_temp_k=effective_temp_k,
+                road_moisture=road_moisture,
+                rubbering_level=rubbering_level,
+                asphalt_roughness=asphalt_roughness,
+            )
+            mu_slide = mu_peak * (1.0 - 0.6 * params.mu_sliding_drop_fraction)
         normal_cell_n = pressure_grid * cell_area_m2
         shear_limit_pa = mu_peak * pressure_grid
+        mean_pressure_pa = normal_load_n / max(area_m2, 1e-9)
+        contact_pressure_factor_grid = pressure_grid / max(mean_pressure_pa, 1e-9)
         local_contact_time_s = np.broadcast_to(contact_time_s * self._local_contact_time_factor, pressure_grid.shape)
         shear_cmd_x = params.shear_stiffness_longitudinal_pa_per_m * local_vx * local_contact_time_s * self._stick_gain
         shear_cmd_y = params.shear_stiffness_lateral_pa_per_m * local_vy * local_contact_time_s * self._stick_gain
@@ -279,20 +318,24 @@ class WheelForceCouplingModel:
         sliding = nonzero & ~sticking
         if np.any(sliding):
             sliding_drop = 1.0 - params.mu_sliding_drop_fraction * sliding_fraction[sliding]
-            shear_cap = shear_limit_pa[sliding] * np.maximum(sliding_drop, 0.5)
+            if params.local_contact.enabled:
+                shear_cap = mu_slide[sliding] * pressure_grid[sliding] * np.maximum(sliding_drop, 0.45)
+            else:
+                shear_cap = shear_limit_pa[sliding] * np.maximum(sliding_drop, 0.5)
             direction_x = shear_cmd_x[sliding] / shear_cmd_mag[sliding]
             direction_y = shear_cmd_y[sliding] / shear_cmd_mag[sliding]
             shear_act_x[sliding] = shear_cap * direction_x
             shear_act_y[sliding] = shear_cap * direction_y
 
         work_partition = 0.25 + 0.75 * sliding_fraction
+        cell_power_w = cell_area_m2 * ((np.abs(shear_act_x * local_vx) + np.abs(shear_act_y * local_vy)) * work_partition)
         fx_total = float(np.sum(shear_act_x) * cell_area_m2)
         fy_total = float(np.sum(shear_act_y) * cell_area_m2)
-        friction_power_total = float(
-            cell_area_m2 * np.sum((np.abs(shear_act_x * local_vx) + np.abs(shear_act_y * local_vy)) * work_partition)
-        )
+        friction_power_total = float(np.sum(cell_power_w))
         weighted_sliding = float(np.sum(sliding_fraction * normal_cell_n))
         weighted_mu = float(np.sum(mu_peak * normal_cell_n))
+        weighted_temp = float(np.sum(effective_temp_k * normal_cell_n))
+        weighted_pressure_factor = float(np.sum(contact_pressure_factor_grid * normal_cell_n))
         total_normal = float(np.sum(normal_cell_n))
         effective_mu = math.hypot(fx_total, fy_total) / max(normal_load_n, 1e-9)
         zone_normal = np.sum(normal_cell_n, axis=0)
@@ -308,6 +351,8 @@ class WheelForceCouplingModel:
             np.sum(sliding_fraction * normal_cell_n, axis=0),
             np.maximum(zone_normal, 1e-9),
         )
+        adhesion_power = float(np.sum(cell_power_w * (1.0 - sliding_fraction)))
+        sliding_power = float(max(friction_power_total - adhesion_power, 0.0))
         return _PatchResponse(
             fx_n=float(fx_total),
             fy_n=float(fy_total),
@@ -316,6 +361,10 @@ class WheelForceCouplingModel:
             contact_patch_width_m=float(patch_width_m),
             sliding_fraction=float(weighted_sliding / max(total_normal, 1e-9)),
             effective_mu=float(weighted_mu / max(total_normal, 1e-9) if total_normal > 0.0 else effective_mu),
+            effective_contact_temperature_k=float(weighted_temp / max(total_normal, 1e-9)),
+            adhesion_power_w=max(adhesion_power, 0.0),
+            sliding_power_w=max(sliding_power, 0.0),
+            contact_pressure_factor=float(weighted_pressure_factor / max(total_normal, 1e-9)),
             zone_effective_mu=np.array(zone_mu, dtype=float, copy=True),
             zone_friction_power_w=np.array(np.maximum(zone_friction_power, 0.0), dtype=float, copy=True),
             zone_sliding_fraction=np.array(np.clip(zone_sliding, 0.0, 1.0), dtype=float, copy=True),
@@ -374,6 +423,10 @@ class WheelForceCouplingModel:
             contact_patch_width_m=0.0,
             sliding_fraction=float(np.mean(zone_sliding)),
             effective_mu=float(mu_peak),
+            effective_contact_temperature_k=float(surface_temp_k),
+            adhesion_power_w=float(0.35 * friction_power_w),
+            sliding_power_w=float(0.65 * friction_power_w),
+            contact_pressure_factor=1.0,
             zone_effective_mu=zone_mu,
             zone_friction_power_w=zone_friction,
             zone_sliding_fraction=zone_sliding,
@@ -447,6 +500,62 @@ class WheelForceCouplingModel:
     ) -> np.ndarray:
         weight = self._clamp(self.parameters.flash_temperature_weight, 0.0, 1.0)
         return (1.0 - weight) * bulk_profile_k[None, :] + weight * flash_profile_k[None, :]
+
+    def _local_contact_temperature_grid_k(
+        self,
+        *,
+        bulk_profile_k: np.ndarray,
+        flash_profile_k: np.ndarray,
+    ) -> np.ndarray:
+        params = self.parameters.local_contact
+        bulk_grid = bulk_profile_k[None, :]
+        flash_grid = flash_profile_k[None, :]
+        blend = self._clamp(params.adhesion_flash_weight, 0.0, 1.0)
+        lead_trail = 0.65 + 0.35 * np.maximum(self._row_grid, 0.0)
+        return (1.0 - blend * lead_trail) * bulk_grid + (blend * lead_trail) * flash_grid
+
+    def _local_friction_coefficients(
+        self,
+        *,
+        normal_load_n: float,
+        contact_pressure_pa: np.ndarray,
+        bulk_profile_k: np.ndarray,
+        flash_profile_k: np.ndarray,
+        road_moisture: float,
+        rubbering_level: float,
+        asphalt_roughness: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        params = self.parameters
+        local = params.local_contact
+        adhesion_temp_k = (1.0 - local.adhesion_flash_weight) * bulk_profile_k[None, :] + local.adhesion_flash_weight * flash_profile_k[None, :]
+        sliding_temp_k = (1.0 - local.sliding_flash_weight) * bulk_profile_k[None, :] + local.sliding_flash_weight * flash_profile_k[None, :]
+        mean_pressure_pa = max(float(np.mean(contact_pressure_pa)), 1e-9)
+        pressure_factor = np.clip(contact_pressure_pa / mean_pressure_pa, 0.5, 1.8)
+        base_adhesion = self._friction_coefficient_grid(
+            normal_load_n=normal_load_n,
+            surface_temp_k=adhesion_temp_k,
+            road_moisture=road_moisture,
+            rubbering_level=rubbering_level,
+            asphalt_roughness=asphalt_roughness,
+        )
+        base_sliding = self._friction_coefficient_grid(
+            normal_load_n=normal_load_n,
+            surface_temp_k=sliding_temp_k,
+            road_moisture=road_moisture,
+            rubbering_level=rubbering_level,
+            asphalt_roughness=asphalt_roughness,
+        )
+        pressure_gain = 1.0 + local.pressure_mu_sensitivity * (pressure_factor - 1.0)
+        adhesion_peak_term = (adhesion_temp_k - local.adhesion_temperature_peak_k) / max(local.adhesion_temperature_width_k, 1e-6)
+        adhesion_shape = local.adhesion_min_fraction + (1.0 - local.adhesion_min_fraction) * np.exp(-(adhesion_peak_term**2))
+        sliding_peak_term = (sliding_temp_k - local.sliding_temperature_peak_k) / max(local.sliding_temperature_width_k, 1e-6)
+        sliding_shape = local.sliding_min_fraction + (1.0 - local.sliding_min_fraction) * np.exp(-(sliding_peak_term**2))
+        mu_adhesion = np.maximum(base_adhesion * pressure_gain * adhesion_shape, params.force_mu_peak * 0.08)
+        mu_sliding = np.maximum(
+            base_sliding * pressure_gain * sliding_shape * (1.0 - local.sliding_mu_drop_fraction),
+            params.force_mu_peak * 0.06,
+        )
+        return mu_adhesion, mu_sliding
 
     def _next_slip_ratio(
         self,

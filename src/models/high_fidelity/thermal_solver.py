@@ -63,6 +63,7 @@ class ThermalFieldSolver2D:
         self._scratch_theta_prev = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_theta_next = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_updated = np.zeros(self._scratch_shape, dtype=float)
+        self._scratch_source = np.zeros(self._scratch_shape, dtype=float)
         self._patch_theta_cells = max(1, int(round(self.parameters.theta_cells * self.parameters.source_patch_theta_fraction)))
         self._patch_radial_cells = max(1, int(round(self.parameters.radial_cells * self.parameters.source_patch_radial_fraction)))
         self._patch_radial_start = max(self.parameters.radial_cells - self._patch_radial_cells, 0)
@@ -72,6 +73,7 @@ class ThermalFieldSolver2D:
             -(self._patch_theta_cells // 2) + self._patch_theta_cells,
             dtype=int,
         )
+        self._width_positions = np.linspace(-1.0, 1.0, self.parameters.width_zones, dtype=float) if self.parameters.width_zones > 1 else np.zeros(1, dtype=float)
 
     @property
     def radial_centers_m(self) -> np.ndarray:
@@ -106,10 +108,8 @@ class ThermalFieldSolver2D:
         layer_source_weights: dict[str, float] | None = None,
     ) -> np.ndarray:
         params = self.parameters
-        source = np.zeros(
-            (params.radial_cells, params.theta_cells, params.width_zones),
-            dtype=float,
-        )
+        source = self._scratch_source
+        source.fill(0.0)
 
         if layer_source_weights:
             _, _, _, _, layer_index = self.layer_property_maps(wear=0.0)
@@ -127,7 +127,7 @@ class ThermalFieldSolver2D:
 
         source_remaining = max(volumetric_source_w_per_m3, 0.0) * max(1.0 - params.source_volumetric_fraction, 0.0)
         if source_remaining <= 0.0:
-            return source
+            return np.array(source, copy=True)
 
         radial_indices, theta_indices, width_indices = self.contact_patch_indices(
             wheel_angular_speed_radps=wheel_angular_speed_radps,
@@ -141,7 +141,7 @@ class ThermalFieldSolver2D:
         zone_weights = zone_weights / max(float(np.sum(zone_weights)), 1e-12)
         patch_extra_density = source_remaining * (params.radial_cells * params.theta_cells) / max(patch_cells, 1)
         source[patch_index] += patch_extra_density * zone_weights[None, None, :]
-        return source
+        return np.array(source, copy=True)
 
     def contact_patch_indices(
         self,
@@ -186,6 +186,7 @@ class ThermalFieldSolver2D:
             if blister_index_w is None
             else np.asarray(blister_index_w, dtype=float)
         )
+        construction = params.construction
 
         radial_span = params.outer_radius_m - params.inner_radius_m
         tread_thickness_m = params.surface_state.tread_thickness_m(wear)
@@ -202,12 +203,17 @@ class ThermalFieldSolver2D:
         total_stack = max(float(np.sum(thicknesses)), 1e-9)
         thicknesses *= radial_span / total_stack
         cumulative_depth = np.cumsum(thicknesses)
+        depth_from_outer = params.outer_radius_m - self._radial_centers_m
+        radial_layer_index = np.zeros(params.radial_cells, dtype=int)
+        radial_layer_index[depth_from_outer > cumulative_depth[0]] = 1
+        radial_layer_index[depth_from_outer > cumulative_depth[1]] = 2
+        radial_layer_index[depth_from_outer > cumulative_depth[2]] = 3
 
         rho_cp = np.zeros_like(self._cell_volumes_m3)
         k_r = np.zeros_like(self._cell_volumes_m3)
         k_theta = np.zeros_like(self._cell_volumes_m3)
         k_w = np.zeros_like(self._cell_volumes_m3)
-        layer_index = np.zeros_like(self._cell_volumes_m3, dtype=int)
+        layer_index = np.broadcast_to(radial_layer_index[:, None, None], self._cell_volumes_m3.shape).copy()
 
         layer_params = (
             LayerEntry("tread", stack.tread),
@@ -215,33 +221,58 @@ class ThermalFieldSolver2D:
             LayerEntry("carcass", stack.carcass),
             LayerEntry("inner_liner", stack.inner_liner),
         )
-        for r_idx, radius_m in enumerate(self._radial_centers_m):
-            depth_from_outer = params.outer_radius_m - radius_m
-            if depth_from_outer <= cumulative_depth[0]:
-                entry = layer_params[0]
-                layer_code = 0
-            elif depth_from_outer <= cumulative_depth[1]:
-                entry = layer_params[1]
-                layer_code = 1
-            elif depth_from_outer <= cumulative_depth[2]:
-                entry = layer_params[2]
-                layer_code = 2
-            else:
-                entry = layer_params[3]
-                layer_code = 3
-
-            for width_idx in range(width_zones):
-                grain_penalty = 1.0 - 0.08 * grain_index[width_idx] if entry.name == "tread" else 1.0
-                blister_scale = params.surface_state.blister_conductivity_penalty if entry.name == "tread" else 0.10
-                blister_penalty = 1.0 - blister_scale * blister_index[width_idx]
-                age_gain = 1.0 + 0.06 * max(age_index, 0.0)
-                rho_cp[r_idx, :, width_idx] = entry.material.volumetric_heat_capacity_j_per_m3k * age_gain
-                k_r[r_idx, :, width_idx] = max(entry.material.k_r_w_per_mk * grain_penalty * blister_penalty, 1e-4)
-                k_theta[r_idx, :, width_idx] = max(entry.material.k_theta_w_per_mk * grain_penalty * blister_penalty, 1e-4)
-                k_w[r_idx, :, width_idx] = max(entry.material.k_w_w_per_mk * blister_penalty, 1e-4)
-                layer_index[r_idx, :, width_idx] = layer_code
+        age_gain = 1.0 + 0.06 * max(age_index, 0.0)
+        tread_grain_penalty = 1.0 - 0.08 * grain_index
+        tread_blister_penalty = 1.0 - params.surface_state.blister_conductivity_penalty * blister_index
+        other_blister_penalty = 1.0 - 0.10 * blister_index
+        for layer_code, entry in enumerate(layer_params):
+            radial_mask = radial_layer_index == layer_code
+            if not np.any(radial_mask):
+                continue
+            grain_penalty = tread_grain_penalty if entry.name == "tread" else np.ones(width_zones, dtype=float)
+            blister_penalty = tread_blister_penalty if entry.name == "tread" else other_blister_penalty
+            k_r_scale, k_theta_scale, k_w_scale = self._construction_conductivity_scale_array(
+                material=entry.material,
+                wear=wear,
+                temperature_k=params.construction.temp_reference_k,
+                construction_enabled=construction.enabled,
+            )
+            rho_cp[radial_mask, :, :] = entry.material.volumetric_heat_capacity_j_per_m3k * age_gain
+            k_r[radial_mask, :, :] = np.maximum(
+                entry.material.k_r_w_per_mk * grain_penalty * blister_penalty * k_r_scale,
+                1e-4,
+            )[None, None, :]
+            k_theta[radial_mask, :, :] = np.maximum(
+                entry.material.k_theta_w_per_mk * grain_penalty * blister_penalty * k_theta_scale,
+                1e-4,
+            )[None, None, :]
+            k_w[radial_mask, :, :] = np.maximum(
+                entry.material.k_w_w_per_mk * blister_penalty * k_w_scale,
+                1e-4,
+            )[None, None, :]
 
         return rho_cp, k_r, k_theta, k_w, layer_index
+
+    def layer_conductivity_scale_summary(
+        self,
+        *,
+        wear: float,
+    ) -> dict[str, float]:
+        outputs: dict[str, float] = {}
+        for layer_name, material in (
+            ("tread", self.parameters.layer_stack.tread),
+            ("belt", self.parameters.layer_stack.belt),
+            ("carcass", self.parameters.layer_stack.carcass),
+            ("inner_liner", self.parameters.layer_stack.inner_liner),
+        ):
+            scales = self._construction_conductivity_scale_array(
+                material=material,
+                wear=wear,
+                temperature_k=self.parameters.construction.temp_reference_k,
+                construction_enabled=self.parameters.construction.enabled,
+            )
+            outputs[layer_name] = float(np.mean(np.stack(scales, axis=0)))
+        return outputs
 
     def layer_mean_temperatures_k(
         self,
@@ -509,6 +540,93 @@ class ThermalFieldSolver2D:
 
     def _total_source_power_w(self, source_w_per_m3: np.ndarray) -> float:
         return float(np.sum(source_w_per_m3 * self._cell_volumes_m3))
+
+    def _construction_conductivity_scale(
+        self,
+        *,
+        material: object,
+        width_idx: int,
+        width_zones: int,
+        wear: float,
+        temperature_k: float,
+        construction_enabled: bool,
+    ) -> tuple[float, float, float]:
+        if not construction_enabled:
+            return 1.0, 1.0, 1.0
+        position = self._width_position(width_idx=width_idx, width_zones=width_zones)
+        shoulder_weight = min(max(abs(position), 0.0), 1.0)
+        center_weight = max(1.0 - abs(position), 0.0)
+        bead_weight = max(1.0 - min(abs(position) / max(self.parameters.construction.bead_width_fraction, 1e-6), 1.0), 0.0)
+        total_weight = max(shoulder_weight + center_weight + bead_weight, 1e-9)
+        shoulder_weight /= total_weight
+        center_weight /= total_weight
+        bead_weight /= total_weight
+        width_bias = (
+            shoulder_weight * material.shoulder_conductivity_bias
+            + center_weight * material.center_conductivity_bias
+            + bead_weight * material.bead_conductivity_bias
+        )
+        temp_gain = 1.0 + material.temp_conductivity_sensitivity_per_k * (
+            temperature_k - self.parameters.construction.temp_reference_k
+        )
+        wear_gain = 1.0 - material.wear_conductivity_sensitivity * np.clip(wear, 0.0, 1.0)
+        reinforcement_delta = max(material.reinforcement_density_factor - 1.0, 0.0)
+        angle_rad = math.radians(material.cord_angle_deg)
+        radial_orient = 1.0 + 0.12 * reinforcement_delta * abs(math.cos(angle_rad))
+        theta_orient = 1.0 + 0.18 * reinforcement_delta * abs(math.sin(angle_rad))
+        width_orient = 1.0 + 0.08 * reinforcement_delta * abs(math.sin(2.0 * angle_rad))
+        common = max(width_bias * temp_gain * wear_gain, 0.25)
+        return (
+            max(common * radial_orient, 0.25),
+            max(common * theta_orient, 0.25),
+            max(common * width_orient, 0.25),
+        )
+
+    def _construction_conductivity_scale_array(
+        self,
+        *,
+        material: object,
+        wear: float,
+        temperature_k: float,
+        construction_enabled: bool,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not construction_enabled:
+            ones = np.ones(self.parameters.width_zones, dtype=float)
+            return ones, ones, ones
+        position = np.abs(self._width_positions)
+        shoulder_weight = np.clip(position, 0.0, 1.0)
+        center_weight = np.maximum(1.0 - position, 0.0)
+        bead_limit = max(self.parameters.construction.bead_width_fraction, 1e-6)
+        bead_weight = np.maximum(1.0 - np.minimum(position / bead_limit, 1.0), 0.0)
+        total_weight = np.maximum(shoulder_weight + center_weight + bead_weight, 1e-9)
+        shoulder_weight = shoulder_weight / total_weight
+        center_weight = center_weight / total_weight
+        bead_weight = bead_weight / total_weight
+        width_bias = (
+            shoulder_weight * material.shoulder_conductivity_bias
+            + center_weight * material.center_conductivity_bias
+            + bead_weight * material.bead_conductivity_bias
+        )
+        temp_gain = 1.0 + material.temp_conductivity_sensitivity_per_k * (
+            temperature_k - self.parameters.construction.temp_reference_k
+        )
+        wear_gain = 1.0 - material.wear_conductivity_sensitivity * np.clip(wear, 0.0, 1.0)
+        reinforcement_delta = max(material.reinforcement_density_factor - 1.0, 0.0)
+        angle_rad = math.radians(material.cord_angle_deg)
+        radial_orient = 1.0 + 0.12 * reinforcement_delta * abs(math.cos(angle_rad))
+        theta_orient = 1.0 + 0.18 * reinforcement_delta * abs(math.sin(angle_rad))
+        width_orient = 1.0 + 0.08 * reinforcement_delta * abs(math.sin(2.0 * angle_rad))
+        common = np.maximum(width_bias * temp_gain * wear_gain, 0.25)
+        return (
+            np.maximum(common * radial_orient, 0.25),
+            np.maximum(common * theta_orient, 0.25),
+            np.maximum(common * width_orient, 0.25),
+        )
+
+    def _width_position(self, *, width_idx: int, width_zones: int) -> float:
+        if width_zones <= 1:
+            return 0.0
+        return -1.0 + 2.0 * width_idx / max(width_zones - 1, 1)
 
 
 @dataclass(frozen=True)

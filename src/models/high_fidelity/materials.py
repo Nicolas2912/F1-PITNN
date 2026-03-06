@@ -253,6 +253,24 @@ class ViscoelasticMaterialModel:
             "carcass": stack.carcass.hysteresis_scale,
             "sidewall": 0.85 * stack.carcass.hysteresis_scale,
         }
+        if self.parameters.construction.enabled:
+            construction = self.parameters.construction
+            scale_by_layer["tread"] *= self._construction_hysteresis_scale(
+                material=stack.tread,
+                width_bias=1.0,
+            )
+            scale_by_layer["belt"] *= self._construction_hysteresis_scale(
+                material=stack.belt,
+                width_bias=0.96,
+            )
+            scale_by_layer["carcass"] *= self._construction_hysteresis_scale(
+                material=stack.carcass,
+                width_bias=0.94,
+            )
+            scale_by_layer["sidewall"] *= self._construction_hysteresis_scale(
+                material=stack.carcass,
+                width_bias=1.04,
+            )
         temperature_offset_by_layer = {
             "tread": 4.0,
             "belt": 0.0,
@@ -304,3 +322,27 @@ class ViscoelasticMaterialModel:
             summary.total_power_density_w_per_m3,
             summary.deformation,
         )
+
+    def layer_hysteresis_scale_summary(self) -> dict[str, float]:
+        stack = self.parameters.layer_stack
+        outputs = {
+            "tread": stack.tread.hysteresis_scale,
+            "belt": stack.belt.hysteresis_scale,
+            "carcass": stack.carcass.hysteresis_scale,
+            "sidewall": 0.85 * stack.carcass.hysteresis_scale,
+        }
+        if not self.parameters.construction.enabled:
+            return outputs
+        return {
+            "tread": outputs["tread"] * self._construction_hysteresis_scale(material=stack.tread, width_bias=1.0),
+            "belt": outputs["belt"] * self._construction_hysteresis_scale(material=stack.belt, width_bias=0.96),
+            "carcass": outputs["carcass"] * self._construction_hysteresis_scale(material=stack.carcass, width_bias=0.94),
+            "sidewall": outputs["sidewall"] * self._construction_hysteresis_scale(material=stack.carcass, width_bias=1.04),
+        }
+
+    def _construction_hysteresis_scale(self, *, material: object, width_bias: float) -> float:
+        construction = self.parameters.construction
+        reinforcement = 1.0 + construction.reinforcement_hysteresis_gain * max(material.reinforcement_density_factor - 1.0, -0.5)
+        angle_term = 1.0 + construction.cord_angle_hysteresis_gain * abs(math.sin(math.radians(material.cord_angle_deg)))
+        width_term = 1.0 + construction.width_hysteresis_gain * (width_bias - 1.0)
+        return max(reinforcement * angle_term * width_term, 0.5)
