@@ -50,6 +50,17 @@ class VehicleInputs:
     drive_power_w: float = 0.0
     ambient_temp_k: float = celsius_to_kelvin(25.0)
     track_temp_k: float = celsius_to_kelvin(35.0)
+    road_bulk_temp_k: float | None = None
+    wind_mps: float = 0.0
+    wind_yaw_rad: float = 0.0
+    humidity_rel: float = 0.50
+    solar_w_m2: float = 0.0
+    road_moisture: float = 0.0
+    rubbering_level: float = 0.0
+    asphalt_roughness: float = 1.0
+    asphalt_effusivity: float = 1.0
+    brake_duct_cooling_factor_by_wheel: Mapping[WheelId, float] | None = None
+    wheel_wake_factor_by_wheel: Mapping[WheelId, float] | None = None
     wheel_angular_speed_radps: Mapping[WheelId, float] | None = None
     camber_rad_by_wheel: Mapping[WheelId, float] | None = None
     toe_rad_by_wheel: Mapping[WheelId, float] | None = None

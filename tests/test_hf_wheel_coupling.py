@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+import pytest
+
 from models.high_fidelity import (
     HighFidelityTireInputs,
     HighFidelityTireModelParameters,
@@ -26,7 +29,10 @@ def _inputs(**overrides: float | None) -> HighFidelityTireInputs:
 
 
 def test_p5_wheel_coupling_converges_within_iteration_budget_for_nominal_case() -> None:
-    params = HighFidelityTireModelParameters()
+    params = HighFidelityTireModelParameters(
+        use_reduced_patch_mechanics=True,
+        use_local_temp_friction_partition=True,
+    )
     model = WheelForceCouplingModel(params)
 
     baseline = model.solve(
@@ -51,6 +57,8 @@ def test_p5_wheel_coupling_converges_within_iteration_budget_for_nominal_case() 
 
 def test_p5_wheel_coupling_fallback_is_deterministic_and_bounded_when_not_converged() -> None:
     params = HighFidelityTireModelParameters(
+        use_reduced_patch_mechanics=True,
+        use_local_temp_friction_partition=True,
         max_coupling_iterations=1,
         max_effective_slip_ratio=0.18,
         max_effective_slip_angle_rad=0.12,
@@ -87,6 +95,9 @@ def test_p5_simulator_reports_coupled_effective_slips_and_force_balance() -> Non
     params = HighFidelityTireModelParameters(
         use_2d_thermal_solver=True,
         no_op_thermal_step=False,
+        use_reduced_patch_mechanics=True,
+        use_local_temp_friction_partition=True,
+        use_structural_hysteresis_model=True,
         radial_cells=10,
         theta_cells=20,
         internal_solver_dt_s=0.01,
@@ -116,7 +127,62 @@ def test_p5_simulator_reports_coupled_effective_slips_and_force_balance() -> Non
     assert math.isfinite(diag.torque_residual_nm)
     assert math.isfinite(diag.lateral_force_residual_n)
     assert diag.friction_power_total_w >= 0.0
-    assert (
-        abs(diag.effective_slip_ratio - control.slip_ratio_cmd) > 1e-6
-        or abs(diag.effective_slip_angle_rad - control.slip_angle_cmd_rad) > 1e-6
+    assert diag.contact_patch_length_m > 0.0
+    assert diag.contact_patch_width_m > 0.0
+    assert 0.0 <= diag.sliding_fraction <= 1.0
+    assert diag.effective_mu > 0.0
+    assert sum(diag.per_zone_friction_power_w) == pytest.approx(diag.friction_power_total_w, rel=1e-6)
+    assert sum(diag.per_zone_friction_power_tire_w) == pytest.approx(diag.friction_power_tire_w, rel=1e-6)
+    assert sum(diag.per_zone_friction_power_road_w) == pytest.approx(diag.friction_power_road_w, rel=1e-6)
+    assert abs(diag.torque_residual_nm) <= params.coupling_torque_tolerance_nm
+    assert abs(diag.lateral_force_residual_n) <= params.coupling_force_tolerance_n
+
+
+def test_p5_hot_flash_temperature_reduces_available_grip() -> None:
+    params = HighFidelityTireModelParameters(
+        use_reduced_patch_mechanics=True,
+        use_local_temp_friction_partition=True,
     )
+    model = WheelForceCouplingModel(params)
+    inputs = _inputs(slip_ratio_cmd=0.08, slip_angle_cmd_rad=0.04)
+
+    cooler = model.solve(
+        inputs=inputs,
+        surface_temp_k=celsius_to_kelvin(85.0),
+        bulk_surface_temp_k=celsius_to_kelvin(80.0),
+        flash_surface_temp_k=celsius_to_kelvin(85.0),
+    )
+    overheated = model.solve(
+        inputs=inputs,
+        surface_temp_k=celsius_to_kelvin(120.0),
+        bulk_surface_temp_k=celsius_to_kelvin(90.0),
+        flash_surface_temp_k=celsius_to_kelvin(125.0),
+    )
+
+    assert overheated.effective_mu < cooler.effective_mu
+    assert abs(overheated.longitudinal_force_n) < abs(cooler.longitudinal_force_n)
+
+
+def test_p5_local_temperature_partition_increases_tire_heat_with_hotter_flash_layer() -> None:
+    params = HighFidelityTireModelParameters(
+        use_reduced_patch_mechanics=True,
+        use_local_temp_friction_partition=True,
+    )
+    model = WheelForceCouplingModel(params)
+    inputs = _inputs(slip_ratio_cmd=0.10, slip_angle_cmd_rad=0.05)
+
+    cooler = model.solve(
+        inputs=inputs,
+        surface_temp_k=celsius_to_kelvin(88.0),
+        bulk_surface_temp_k=celsius_to_kelvin(85.0),
+        flash_surface_temp_k=celsius_to_kelvin(90.0),
+    )
+    hotter = model.solve(
+        inputs=inputs,
+        surface_temp_k=celsius_to_kelvin(98.0),
+        bulk_surface_temp_k=celsius_to_kelvin(90.0),
+        flash_surface_temp_k=celsius_to_kelvin(118.0),
+    )
+
+    assert np.mean(hotter.zone_effective_mu) < np.mean(cooler.zone_effective_mu)
+    assert np.mean(hotter.zone_sliding_fraction) >= np.mean(cooler.zone_sliding_fraction)

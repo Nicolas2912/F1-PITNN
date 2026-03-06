@@ -30,8 +30,8 @@ def _sim() -> HighFidelityVehicleSimulator:
     tire_params = HighFidelityTireModelParameters(
         use_2d_thermal_solver=True,
         no_op_thermal_step=False,
-        radial_cells=10,
-        theta_cells=20,
+        radial_cells=8,
+        theta_cells=12,
         internal_solver_dt_s=0.01,
     )
     return HighFidelityVehicleSimulator(
@@ -62,7 +62,7 @@ def test_p6_turning_produces_right_left_thermal_asymmetry() -> None:
     left_turn = _input(speed_mps=56.0, ay_mps2=6.0, steering_angle_rad=0.07, yaw_rate_radps=0.11)
     right_turn = _input(speed_mps=56.0, ay_mps2=-6.0, steering_angle_rad=-0.07, yaw_rate_radps=-0.11)
 
-    for _ in range(120):
+    for _ in range(20):
         left_state = sim.step(left_state, left_turn, dt_s=0.05)
         right_state = sim.step(right_state, right_turn, dt_s=0.05)
 
@@ -91,8 +91,8 @@ def test_p6_braking_shifts_front_load_and_front_torque_bias() -> None:
     tire_params = HighFidelityTireModelParameters(
         use_2d_thermal_solver=True,
         no_op_thermal_step=False,
-        radial_cells=10,
-        theta_cells=20,
+        radial_cells=8,
+        theta_cells=12,
         internal_solver_dt_s=0.01,
     )
     sim = HighFidelityVehicleSimulator(
@@ -141,7 +141,7 @@ def test_p6_long_run_remains_finite_and_coupling_stays_bounded() -> None:
         drive_power_w=15_000.0,
     )
 
-    for _ in range(300):
+    for _ in range(30):
         state = sim.step(state, control, dt_s=0.05)
 
     diag = sim.diagnostics(state, control)

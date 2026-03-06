@@ -39,7 +39,10 @@ target-version = "py314"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not slow'"
+markers = [
+    "slow: slower high-fidelity integration and benchmark coverage",
+]
 
 [tool.mypy]
 python_version = "3.14"

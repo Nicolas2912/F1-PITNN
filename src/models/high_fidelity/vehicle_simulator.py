@@ -221,11 +221,32 @@ class HighFidelityVehicleSimulator:
             brake_power_w=max(brake_torque_nm, 0.0) * abs(wheel_omega),
             ambient_temp_k=inputs.ambient_temp_k,
             track_temp_k=inputs.track_temp_k,
+            wind_mps=inputs.wind_mps,
+            wind_yaw_rad=inputs.wind_yaw_rad,
+            humidity_rel=inputs.humidity_rel,
+            solar_w_m2=inputs.solar_w_m2,
             road_surface_temp_k=inputs.track_temp_k,
-            road_bulk_temp_k=inputs.track_temp_k,
-            wind_mps=0.0,
-            humidity_rel=0.50,
-            solar_w_m2=0.0,
+            road_bulk_temp_k=inputs.track_temp_k if inputs.road_bulk_temp_k is None else inputs.road_bulk_temp_k,
+            road_moisture=inputs.road_moisture,
+            rubbering_level=inputs.rubbering_level,
+            asphalt_roughness=inputs.asphalt_roughness,
+            asphalt_effusivity=inputs.asphalt_effusivity,
+            brake_duct_cooling_factor=(
+                1.0
+                if inputs.brake_duct_cooling_factor_by_wheel is None
+                else inputs.brake_duct_cooling_factor_by_wheel.get(wheel, 1.0)
+            ),
+            wheel_wake_factor=(
+                1.0
+                if inputs.wheel_wake_factor_by_wheel is None
+                else inputs.wheel_wake_factor_by_wheel.get(wheel, 1.0)
+            ),
+            camber_rad=0.0 if inputs.camber_rad_by_wheel is None else inputs.camber_rad_by_wheel.get(wheel, 0.0),
+            toe_rad=0.0 if inputs.toe_rad_by_wheel is None else inputs.toe_rad_by_wheel.get(wheel, 0.0),
+            lateral_accel_mps2=inputs.ay_mps2,
+            longitudinal_accel_mps2=inputs.ax_mps2,
+            is_left_tire=wheel in ("FL", "RL"),
+            is_front_tire=wheel in ("FL", "FR"),
         )
 
     def _wheel_vertical_loads(self, inputs: VehicleInputs) -> dict[WheelId, float]:

@@ -37,7 +37,66 @@ class ScenarioConfig:
     drive_power_w: float
     ambient_temp_k: float
     track_temp_k: float
+    road_bulk_temp_k: float | None = None
+    wind_mps: float = 0.0
+    wind_yaw_rad: float = 0.0
+    humidity_rel: float = 0.50
+    solar_w_m2: float = 0.0
+    road_moisture: float = 0.0
+    rubbering_level: float = 0.0
+    asphalt_roughness: float = 1.0
+    asphalt_effusivity: float = 1.0
     include_in_uq: bool = True
+
+
+@dataclass(frozen=True)
+class FidelityPreset:
+    name: str
+    radial_cells: int
+    theta_cells: int
+    internal_solver_dt_s: float
+    lhs_samples: int
+    sobol_samples: int
+    diagnostics_stride: int
+
+
+PRESETS: dict[str, FidelityPreset] = {
+    "smoke": FidelityPreset(
+        name="smoke",
+        radial_cells=4,
+        theta_cells=8,
+        internal_solver_dt_s=0.05,
+        lhs_samples=2,
+        sobol_samples=2,
+        diagnostics_stride=1,
+    ),
+    "dev": FidelityPreset(
+        name="dev",
+        radial_cells=8,
+        theta_cells=16,
+        internal_solver_dt_s=0.03,
+        lhs_samples=8,
+        sobol_samples=8,
+        diagnostics_stride=2,
+    ),
+    "full": FidelityPreset(
+        name="full",
+        radial_cells=24,
+        theta_cells=72,
+        internal_solver_dt_s=0.01,
+        lhs_samples=128,
+        sobol_samples=512,
+        diagnostics_stride=1,
+    ),
+}
+
+
+def fidelity_preset(name: str) -> FidelityPreset:
+    preset = PRESETS.get(name)
+    if preset is None:
+        msg = f"Unknown preset '{name}'. Expected one of {sorted(PRESETS)}"
+        raise ValueError(msg)
+    return preset
 
 
 def default_tire_parameters(
@@ -49,6 +108,9 @@ def default_tire_parameters(
     return HighFidelityTireModelParameters(
         use_2d_thermal_solver=True,
         no_op_thermal_step=False,
+        use_local_temp_friction_partition=True,
+        use_reduced_patch_mechanics=True,
+        use_structural_hysteresis_model=True,
         radial_cells=radial_cells,
         theta_cells=theta_cells,
         internal_solver_dt_s=internal_solver_dt_s,
@@ -59,83 +121,160 @@ def default_scenarios(*, duration_scale: float = 1.0) -> tuple[ScenarioConfig, .
     return (
         ScenarioConfig(
             name="steady_corner",
-            duration_s=6.0 * duration_scale,
-            speed_mps=56.0,
+            duration_s=10.0 * duration_scale,
+            speed_mps=60.0,
             ax_mps2=0.0,
-            ay_mps2=6.5,
-            steering_angle_rad=0.075,
-            yaw_rate_radps=0.115,
+            ay_mps2=7.8,
+            steering_angle_rad=0.085,
+            yaw_rate_radps=0.132,
             brake_power_w=0.0,
-            drive_power_w=18_000.0,
-            ambient_temp_k=303.15,
-            track_temp_k=317.15,
+            drive_power_w=30_000.0,
+            ambient_temp_k=304.15,
+            track_temp_k=320.15,
+            road_bulk_temp_k=315.15,
+            wind_mps=7.0,
+            wind_yaw_rad=0.10,
+            solar_w_m2=260.0,
+            rubbering_level=0.72,
+            asphalt_roughness=1.05,
+            asphalt_effusivity=1.08,
         ),
         ScenarioConfig(
             name="straight_braking",
-            duration_s=5.0 * duration_scale,
-            speed_mps=64.0,
-            ax_mps2=-6.8,
+            duration_s=7.0 * duration_scale,
+            speed_mps=72.0,
+            ax_mps2=-8.4,
             ay_mps2=0.0,
             steering_angle_rad=0.0,
             yaw_rate_radps=0.0,
-            brake_power_w=82_000.0,
+            brake_power_w=135_000.0,
             drive_power_w=0.0,
-            ambient_temp_k=303.15,
-            track_temp_k=317.15,
+            ambient_temp_k=304.15,
+            track_temp_k=321.15,
+            road_bulk_temp_k=316.15,
+            wind_mps=5.0,
+            solar_w_m2=200.0,
+            rubbering_level=0.68,
+            asphalt_roughness=1.02,
+            asphalt_effusivity=1.05,
         ),
         ScenarioConfig(
             name="straight_acceleration",
-            duration_s=5.0 * duration_scale,
-            speed_mps=48.0,
-            ax_mps2=4.5,
+            duration_s=7.0 * duration_scale,
+            speed_mps=42.0,
+            ax_mps2=5.6,
             ay_mps2=0.0,
             steering_angle_rad=0.0,
             yaw_rate_radps=0.0,
             brake_power_w=0.0,
-            drive_power_w=72_000.0,
-            ambient_temp_k=303.15,
-            track_temp_k=317.15,
+            drive_power_w=115_000.0,
+            ambient_temp_k=304.15,
+            track_temp_k=320.15,
+            road_bulk_temp_k=315.15,
+            wind_mps=4.5,
+            solar_w_m2=240.0,
+            rubbering_level=0.74,
+            asphalt_roughness=1.04,
+            asphalt_effusivity=1.06,
         ),
         ScenarioConfig(
             name="combined_brake_corner",
-            duration_s=6.0 * duration_scale,
-            speed_mps=54.0,
-            ax_mps2=-4.8,
-            ay_mps2=5.3,
-            steering_angle_rad=0.070,
-            yaw_rate_radps=0.102,
-            brake_power_w=54_000.0,
+            duration_s=8.0 * duration_scale,
+            speed_mps=58.0,
+            ax_mps2=-5.6,
+            ay_mps2=6.4,
+            steering_angle_rad=0.078,
+            yaw_rate_radps=0.118,
+            brake_power_w=92_000.0,
             drive_power_w=0.0,
-            ambient_temp_k=303.15,
-            track_temp_k=317.15,
+            ambient_temp_k=304.15,
+            track_temp_k=321.15,
+            road_bulk_temp_k=316.15,
+            wind_mps=6.0,
+            wind_yaw_rad=0.08,
+            humidity_rel=0.56,
+            solar_w_m2=190.0,
+            rubbering_level=0.70,
+            asphalt_roughness=1.03,
+            asphalt_effusivity=1.07,
         ),
         ScenarioConfig(
             name="cooldown",
-            duration_s=5.0 * duration_scale,
-            speed_mps=32.0,
-            ax_mps2=-1.2,
+            duration_s=7.0 * duration_scale,
+            speed_mps=34.0,
+            ax_mps2=-1.4,
             ay_mps2=0.0,
             steering_angle_rad=0.0,
             yaw_rate_radps=0.0,
-            brake_power_w=6_000.0,
+            brake_power_w=8_000.0,
             drive_power_w=0.0,
             ambient_temp_k=301.15,
-            track_temp_k=311.15,
+            track_temp_k=312.15,
+            road_bulk_temp_k=308.15,
+            wind_mps=9.0,
+            humidity_rel=0.68,
+            solar_w_m2=120.0,
+            road_moisture=0.20,
+            rubbering_level=0.50,
+            asphalt_roughness=0.96,
+            asphalt_effusivity=1.10,
         ),
         ScenarioConfig(
             name="long_stint",
-            duration_s=30.0 * duration_scale,
-            speed_mps=52.0,
-            ax_mps2=0.2,
-            ay_mps2=4.2,
-            steering_angle_rad=0.050,
-            yaw_rate_radps=0.082,
-            brake_power_w=4_000.0,
-            drive_power_w=12_000.0,
+            duration_s=55.0 * duration_scale,
+            speed_mps=56.0,
+            ax_mps2=0.3,
+            ay_mps2=5.0,
+            steering_angle_rad=0.058,
+            yaw_rate_radps=0.094,
+            brake_power_w=7_000.0,
+            drive_power_w=22_000.0,
             ambient_temp_k=304.15,
-            track_temp_k=319.15,
+            track_temp_k=322.15,
+            road_bulk_temp_k=317.15,
+            wind_mps=5.5,
+            wind_yaw_rad=0.05,
+            humidity_rel=0.48,
+            solar_w_m2=280.0,
+            rubbering_level=0.82,
+            asphalt_roughness=1.06,
+            asphalt_effusivity=1.09,
             include_in_uq=False,
         ),
+    )
+
+
+def _vehicle_inputs_for_scenario(scenario: ScenarioConfig) -> VehicleInputs:
+    return VehicleInputs(
+        speed_mps=scenario.speed_mps,
+        ax_mps2=scenario.ax_mps2,
+        ay_mps2=scenario.ay_mps2,
+        steering_angle_rad=scenario.steering_angle_rad,
+        yaw_rate_radps=scenario.yaw_rate_radps,
+        brake_power_w=scenario.brake_power_w,
+        drive_power_w=scenario.drive_power_w,
+        ambient_temp_k=scenario.ambient_temp_k,
+        track_temp_k=scenario.track_temp_k,
+        road_bulk_temp_k=scenario.track_temp_k if scenario.road_bulk_temp_k is None else scenario.road_bulk_temp_k,
+        wind_mps=scenario.wind_mps,
+        wind_yaw_rad=scenario.wind_yaw_rad,
+        humidity_rel=scenario.humidity_rel,
+        solar_w_m2=scenario.solar_w_m2,
+        road_moisture=scenario.road_moisture,
+        rubbering_level=scenario.rubbering_level,
+        asphalt_roughness=scenario.asphalt_roughness,
+        asphalt_effusivity=scenario.asphalt_effusivity,
+    )
+
+
+def _vehicle_simulator(
+    *,
+    tire_parameters: HighFidelityTireModelParameters,
+    vehicle_parameters: VehicleParameters,
+) -> HighFidelityVehicleSimulator:
+    return HighFidelityVehicleSimulator(
+        parameters=vehicle_parameters,
+        tire_parameters_by_wheel={wheel: tire_parameters for wheel in ("FL", "FR", "RL", "RR")},
     )
 
 
@@ -143,18 +282,28 @@ def run_high_fidelity_no_data(
     *,
     output_path: Path = RESULTS_FILE,
     summary_path: Path = SUMMARY_FILE,
-    lhs_samples: int = 400,
-    sobol_samples: int = 2048,
+    preset: str = "full",
+    lhs_samples: int | None = None,
+    sobol_samples: int | None = None,
     seed: int = 2026,
     dt_s: float = 0.2,
     duration_scale: float = 1.0,
+    diagnostics_stride: int | None = None,
     tire_parameters: HighFidelityTireModelParameters | None = None,
     vehicle_parameters: VehicleParameters | None = None,
 ) -> dict:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-    tire_params = tire_parameters if tire_parameters is not None else default_tire_parameters()
+    active_preset = fidelity_preset(preset)
+    lhs_samples = active_preset.lhs_samples if lhs_samples is None else lhs_samples
+    sobol_samples = active_preset.sobol_samples if sobol_samples is None else sobol_samples
+    diagnostics_stride = active_preset.diagnostics_stride if diagnostics_stride is None else diagnostics_stride
+    tire_params = tire_parameters if tire_parameters is not None else default_tire_parameters(
+        radial_cells=active_preset.radial_cells,
+        theta_cells=active_preset.theta_cells,
+        internal_solver_dt_s=active_preset.internal_solver_dt_s,
+    )
     vehicle_params = vehicle_parameters if vehicle_parameters is not None else VehicleParameters()
     scenarios = default_scenarios(duration_scale=duration_scale)
     baseline = run_scenario_pack(
@@ -162,6 +311,7 @@ def run_high_fidelity_no_data(
         tire_parameters=tire_params,
         vehicle_parameters=vehicle_params,
         dt_s=dt_s,
+        diagnostics_stride=diagnostics_stride,
     )
 
     uq = HighFidelityUQ()
@@ -174,6 +324,7 @@ def run_high_fidelity_no_data(
         uq=uq,
         lhs_samples=lhs_samples,
         seed=seed,
+        diagnostics_stride=diagnostics_stride,
     )
     sobol_result = run_sobol_uq(
         scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
@@ -183,6 +334,7 @@ def run_high_fidelity_no_data(
         uq=uq,
         sobol_samples=sobol_samples,
         seed=seed,
+        diagnostics_stride=diagnostics_stride,
     )
 
     artifact = {
@@ -193,11 +345,14 @@ def run_high_fidelity_no_data(
             "lhs_samples": int(lhs_samples),
             "sobol_samples": int(sobol_samples),
             "seed": int(seed),
+            "preset": active_preset.name,
+            "diagnostics_stride": int(diagnostics_stride),
             "radial_cells": int(tire_params.radial_cells),
             "theta_cells": int(tire_params.theta_cells),
             "internal_solver_dt_s": float(tire_params.internal_solver_dt_s),
             "results_path": str(output_path),
             "summary_path": str(summary_path),
+            "default_output_mode": "bands_plus_baseline",
             "scenario_names": [scenario.name for scenario in scenarios],
             "uq_scenario_names": [scenario.name for scenario in scenarios if scenario.include_in_uq],
         },
@@ -222,7 +377,13 @@ def run_scenario_pack(
     tire_parameters: HighFidelityTireModelParameters,
     vehicle_parameters: VehicleParameters,
     dt_s: float,
+    diagnostics_stride: int = 1,
 ) -> dict:
+    simulator = _vehicle_simulator(
+        tire_parameters=tire_parameters,
+        vehicle_parameters=vehicle_parameters,
+    )
+    scenario_inputs = {scenario.name: _vehicle_inputs_for_scenario(scenario) for scenario in scenarios}
     scenario_traces: dict[str, dict] = {}
     scenario_summaries: dict[str, dict] = {}
     for scenario in scenarios:
@@ -231,6 +392,9 @@ def run_scenario_pack(
             tire_parameters=tire_parameters,
             vehicle_parameters=vehicle_parameters,
             dt_s=dt_s,
+            diagnostics_stride=diagnostics_stride,
+            simulator=simulator,
+            inputs=scenario_inputs[scenario.name],
         )
         scenario_traces[scenario.name] = result["trace"]
         scenario_summaries[scenario.name] = result["summary"]
@@ -246,23 +410,16 @@ def run_single_scenario(
     tire_parameters: HighFidelityTireModelParameters,
     vehicle_parameters: VehicleParameters,
     dt_s: float,
+    diagnostics_stride: int = 1,
+    simulator: HighFidelityVehicleSimulator | None = None,
+    inputs: VehicleInputs | None = None,
 ) -> dict:
-    simulator = HighFidelityVehicleSimulator(
-        parameters=vehicle_parameters,
-        tire_parameters_by_wheel={wheel: tire_parameters for wheel in ("FL", "FR", "RL", "RR")},
+    active_simulator = simulator if simulator is not None else _vehicle_simulator(
+        tire_parameters=tire_parameters,
+        vehicle_parameters=vehicle_parameters,
     )
-    state = simulator.initial_state(ambient_temp_k=scenario.ambient_temp_k)
-    inputs = VehicleInputs(
-        speed_mps=scenario.speed_mps,
-        ax_mps2=scenario.ax_mps2,
-        ay_mps2=scenario.ay_mps2,
-        steering_angle_rad=scenario.steering_angle_rad,
-        yaw_rate_radps=scenario.yaw_rate_radps,
-        brake_power_w=scenario.brake_power_w,
-        drive_power_w=scenario.drive_power_w,
-        ambient_temp_k=scenario.ambient_temp_k,
-        track_temp_k=scenario.track_temp_k,
-    )
+    active_inputs = inputs if inputs is not None else _vehicle_inputs_for_scenario(scenario)
+    state = active_simulator.initial_state(ambient_temp_k=scenario.ambient_temp_k)
 
     steps = max(int(round(scenario.duration_s / dt_s)), 1)
     time_s = [0.0]
@@ -273,7 +430,7 @@ def run_single_scenario(
     coupling_converged_fraction = []
     any_non_finite = False
 
-    initial_diag = simulator.diagnostics(state, inputs)
+    initial_diag = active_simulator.diagnostics(state, active_inputs)
     mean_core_temp_c.append(_mean_dict_value(initial_diag.wheel_core_temp_c))
     mean_surface_temp_c.append(_mean_dict_value(initial_diag.wheel_surface_temp_c))
     load_error_pct.append(initial_diag.load_conservation_error_pct)
@@ -284,18 +441,20 @@ def run_single_scenario(
     converged_wheel_steps = 0
     total_wheel_steps = 0
 
+    diagnostics_stride = max(int(diagnostics_stride), 1)
     for step in range(1, steps + 1):
-        state = simulator.step(state, inputs, dt_s=dt_s)
-        diag = simulator.diagnostics(state, inputs)
-        time_s.append(step * dt_s)
-        mean_core_temp_c.append(_mean_dict_value(diag.wheel_core_temp_c))
-        mean_surface_temp_c.append(_mean_dict_value(diag.wheel_surface_temp_c))
-        load_error_pct.append(diag.load_conservation_error_pct)
-        max_energy_residual_pct.append(_max_energy_residual(diag))
-        coupling_converged_fraction.append(_coupling_converged_fraction(diag))
-        any_non_finite = any_non_finite or _diag_has_non_finite(diag)
-        converged_wheel_steps += sum(1 for ok in diag.wheel_coupling_converged.values() if ok)
-        total_wheel_steps += len(diag.wheel_coupling_converged)
+        state = active_simulator.step(state, active_inputs, dt_s=dt_s)
+        if step % diagnostics_stride == 0 or step == steps:
+            diag = active_simulator.diagnostics(state, active_inputs)
+            time_s.append(step * dt_s)
+            mean_core_temp_c.append(_mean_dict_value(diag.wheel_core_temp_c))
+            mean_surface_temp_c.append(_mean_dict_value(diag.wheel_surface_temp_c))
+            load_error_pct.append(diag.load_conservation_error_pct)
+            max_energy_residual_pct.append(_max_energy_residual(diag))
+            coupling_converged_fraction.append(_coupling_converged_fraction(diag))
+            any_non_finite = any_non_finite or _diag_has_non_finite(diag)
+            converged_wheel_steps += sum(1 for ok in diag.wheel_coupling_converged.values() if ok)
+            total_wheel_steps += len(diag.wheel_coupling_converged)
 
     trace = {
         "time_s": time_s,
@@ -329,10 +488,12 @@ def run_lhs_uq(
     uq: HighFidelityUQ,
     lhs_samples: int,
     seed: int,
+    diagnostics_stride: int = 1,
 ) -> dict:
     priors = uq.default_tire_priors(parameters=tire_parameters)
     unit_samples = uq.latin_hypercube(priors=priors, sample_count=lhs_samples, seed=seed)
     mapped = uq.map_priors(unit_samples=unit_samples, priors=priors)
+    scenario_inputs = {scenario.name: _vehicle_inputs_for_scenario(scenario) for scenario in scenarios}
 
     scenario_core_traces: dict[str, list[np.ndarray]] = {scenario.name: [] for scenario in scenarios}
     scenario_surface_traces: dict[str, list[np.ndarray]] = {scenario.name: [] for scenario in scenarios}
@@ -344,12 +505,19 @@ def run_lhs_uq(
     for sample_idx in range(lhs_samples):
         sample = {prior.name: float(mapped[prior.name][sample_idx]) for prior in priors}
         sampled_tire_parameters = uq.apply_sample(base=tire_parameters, sample=sample)
+        simulator = _vehicle_simulator(
+            tire_parameters=sampled_tire_parameters,
+            vehicle_parameters=vehicle_parameters,
+        )
         for scenario in scenarios:
             result = run_single_scenario(
                 scenario=scenario,
                 tire_parameters=sampled_tire_parameters,
                 vehicle_parameters=vehicle_parameters,
                 dt_s=dt_s,
+                diagnostics_stride=diagnostics_stride,
+                simulator=simulator,
+                inputs=scenario_inputs[scenario.name],
             )
             core_trace = np.asarray(result["trace"]["mean_core_temp_c"], dtype=float)
             surface_trace = np.asarray(result["trace"]["mean_surface_temp_c"], dtype=float)
@@ -401,16 +569,25 @@ def run_sobol_uq(
     uq: HighFidelityUQ,
     sobol_samples: int,
     seed: int,
+    diagnostics_stride: int = 1,
 ) -> dict:
     priors = uq.default_tire_priors(parameters=tire_parameters)
+    scenario_inputs = _vehicle_inputs_for_scenario(scenario)
 
     def objective(sample: dict[str, float]) -> float:
         sampled_tire_parameters = uq.apply_sample(base=tire_parameters, sample=sample)
+        simulator = _vehicle_simulator(
+            tire_parameters=sampled_tire_parameters,
+            vehicle_parameters=vehicle_parameters,
+        )
         result = run_single_scenario(
             scenario=scenario,
             tire_parameters=sampled_tire_parameters,
             vehicle_parameters=vehicle_parameters,
             dt_s=dt_s,
+            diagnostics_stride=diagnostics_stride,
+            simulator=simulator,
+            inputs=scenario_inputs,
         )
         return float(result["summary"]["peak_mean_surface_temp_c"])
 
@@ -508,31 +685,36 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Run high-fidelity no-data scenario harness.")
+    parser.add_argument("--preset", choices=sorted(PRESETS), default="full")
     parser.add_argument("--output-json", type=Path, default=RESULTS_FILE)
     parser.add_argument("--output-summary", type=Path, default=SUMMARY_FILE)
-    parser.add_argument("--lhs-samples", type=int, default=400)
-    parser.add_argument("--sobol-samples", type=int, default=2048)
+    parser.add_argument("--lhs-samples", type=int, default=None)
+    parser.add_argument("--sobol-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--dt-s", type=float, default=0.2)
     parser.add_argument("--duration-scale", type=float, default=1.0)
-    parser.add_argument("--radial-cells", type=int, default=24)
-    parser.add_argument("--theta-cells", type=int, default=72)
-    parser.add_argument("--internal-dt-s", type=float, default=0.01)
+    parser.add_argument("--radial-cells", type=int, default=None)
+    parser.add_argument("--theta-cells", type=int, default=None)
+    parser.add_argument("--internal-dt-s", type=float, default=None)
+    parser.add_argument("--diagnostics-stride", type=int, default=None)
     args = parser.parse_args()
 
+    preset = fidelity_preset(args.preset)
     tire_parameters = default_tire_parameters(
-        radial_cells=args.radial_cells,
-        theta_cells=args.theta_cells,
-        internal_solver_dt_s=args.internal_dt_s,
+        radial_cells=preset.radial_cells if args.radial_cells is None else args.radial_cells,
+        theta_cells=preset.theta_cells if args.theta_cells is None else args.theta_cells,
+        internal_solver_dt_s=preset.internal_solver_dt_s if args.internal_dt_s is None else args.internal_dt_s,
     )
     run_high_fidelity_no_data(
+        preset=args.preset,
         output_path=args.output_json,
         summary_path=args.output_summary,
-        lhs_samples=args.lhs_samples,
-        sobol_samples=args.sobol_samples,
+        lhs_samples=preset.lhs_samples if args.lhs_samples is None else args.lhs_samples,
+        sobol_samples=preset.sobol_samples if args.sobol_samples is None else args.sobol_samples,
         seed=args.seed,
         dt_s=args.dt_s,
         duration_scale=args.duration_scale,
+        diagnostics_stride=preset.diagnostics_stride if args.diagnostics_stride is None else args.diagnostics_stride,
         tire_parameters=tire_parameters,
     )
 

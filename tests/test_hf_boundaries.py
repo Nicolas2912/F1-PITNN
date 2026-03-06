@@ -40,6 +40,9 @@ def _simulator(
     params = HighFidelityTireModelParameters(
         use_2d_thermal_solver=True,
         no_op_thermal_step=False,
+        use_reduced_patch_mechanics=True,
+        use_local_temp_friction_partition=True,
+        use_structural_hysteresis_model=True,
         radial_cells=10,
         theta_cells=24,
         internal_solver_dt_s=0.01,
@@ -87,6 +90,29 @@ def test_p4_contact_and_rim_flux_signs_are_consistent() -> None:
     assert rim_flux_hot_tire > 0.0
     assert rim_flux_hot_rim < 0.0
     assert h_c_high > h_c_low
+
+
+def test_p4_local_partition_biases_more_heat_into_tire_for_hotter_flash_layer() -> None:
+    model = BoundaryConditionModel(HighFidelityBoundaryParameters(eta_tire=0.60))
+
+    tire_cool, road_cool, eta_cool = model.partition_friction_power_by_zone(
+        zone_friction_power_w=np.array([4_000.0, 4_000.0, 4_000.0]),
+        flash_temp_w_k=np.array([360.0, 360.0, 360.0]),
+        bulk_temp_w_k=np.array([355.0, 355.0, 355.0]),
+        road_surface_temp_w_k=np.array([330.0, 330.0, 330.0]),
+        road_moisture_w=np.zeros(3, dtype=float),
+    )
+    tire_hot, road_hot, eta_hot = model.partition_friction_power_by_zone(
+        zone_friction_power_w=np.array([4_000.0, 4_000.0, 4_000.0]),
+        flash_temp_w_k=np.array([390.0, 390.0, 390.0]),
+        bulk_temp_w_k=np.array([360.0, 360.0, 360.0]),
+        road_surface_temp_w_k=np.array([330.0, 330.0, 330.0]),
+        road_moisture_w=np.zeros(3, dtype=float),
+    )
+
+    assert np.all(eta_hot > eta_cool)
+    assert np.all(tire_hot > tire_cool)
+    assert np.all(road_hot < road_cool)
 
 
 def test_p4_sensitivity_trends_for_eta_hcp_hbead_and_road_temperature() -> None:

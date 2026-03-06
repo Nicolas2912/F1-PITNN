@@ -4,13 +4,189 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..physics import celsius_to_kelvin, kelvin_to_celsius
+from ..physics import (
+    STANDARD_ATMOSPHERIC_PRESSURE_PA,
+    celsius_to_kelvin,
+    kelvin_to_celsius,
+)
 from .boundary_conditions import HighFidelityBoundaryParameters
 
 
 @dataclass(frozen=True)
+class LayerMaterialParameters:
+    thickness_m: float
+    volumetric_heat_capacity_j_per_m3k: float
+    k_r_w_per_mk: float
+    k_theta_w_per_mk: float
+    k_w_w_per_mk: float
+    hysteresis_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class LayerStackParameters:
+    tread: LayerMaterialParameters = field(
+        default_factory=lambda: LayerMaterialParameters(
+            thickness_m=0.012,
+            volumetric_heat_capacity_j_per_m3k=1.95e6,
+            k_r_w_per_mk=0.26,
+            k_theta_w_per_mk=0.29,
+            k_w_w_per_mk=0.22,
+            hysteresis_scale=1.0,
+        )
+    )
+    belt: LayerMaterialParameters = field(
+        default_factory=lambda: LayerMaterialParameters(
+            thickness_m=0.008,
+            volumetric_heat_capacity_j_per_m3k=2.05e6,
+            k_r_w_per_mk=1.8,
+            k_theta_w_per_mk=18.0,
+            k_w_w_per_mk=4.5,
+            hysteresis_scale=0.35,
+        )
+    )
+    carcass: LayerMaterialParameters = field(
+        default_factory=lambda: LayerMaterialParameters(
+            thickness_m=0.068,
+            volumetric_heat_capacity_j_per_m3k=1.85e6,
+            k_r_w_per_mk=0.19,
+            k_theta_w_per_mk=0.28,
+            k_w_w_per_mk=0.18,
+            hysteresis_scale=0.70,
+        )
+    )
+    inner_liner: LayerMaterialParameters = field(
+        default_factory=lambda: LayerMaterialParameters(
+            thickness_m=0.004,
+            volumetric_heat_capacity_j_per_m3k=1.65e6,
+            k_r_w_per_mk=0.12,
+            k_theta_w_per_mk=0.16,
+            k_w_w_per_mk=0.12,
+            hysteresis_scale=0.15,
+        )
+    )
+
+    def total_thickness_m(self, *, tread_thickness_m: float | None = None) -> float:
+        tread = self.tread.thickness_m if tread_thickness_m is None else tread_thickness_m
+        return tread + self.belt.thickness_m + self.carcass.thickness_m + self.inner_liner.thickness_m
+
+
+@dataclass(frozen=True)
+class PressurePatchParameters:
+    pressure_static_bar_gauge: float = 1.4
+    atmospheric_pressure_pa: float = STANDARD_ATMOSPHERIC_PRESSURE_PA
+    reference_pressure_pa: float = 240_000.0
+    gas_specific_constant_j_per_kgk: float = 287.05
+    gas_cv_j_per_kgk: float = 718.0
+    reference_fill_temp_k: float = celsius_to_kelvin(20.0)
+    gas_mass_kg: float | None = None
+    base_volume_m3: float = 0.030
+    minimum_volume_m3: float = 0.016
+    centrifugal_volume_gain_coeff_m3_per_radps2: float = 8.0e-9
+    deflection_volume_loss_coeff_m3_per_n: float = 1.2e-7
+    wear_volume_loss_m3: float = 0.0015
+    contact_pressure_factor: float = 1.0
+    reference_contact_patch_area_m2: float = 0.018
+    min_contact_patch_area_m2: float = 5.0e-4
+    max_contact_patch_area_m2: float = 0.045
+    reference_normal_load_n: float = 3_500.0
+    carcass_support_pressure_pa: float = 72_000.0
+    carcass_support_load_gain: float = 0.22
+    carcass_support_temp_gain_per_k: float = 1.5e-3
+    min_effective_contact_pressure_pa: float = 20_000.0
+    patch_camber_pressure_skew: float = 0.24
+    patch_toe_pressure_skew: float = 0.12
+    patch_longitudinal_pressure_skew: float = 0.18
+    patch_pressure_min_fraction: float = 0.25
+    patch_pressure_norm_tol_n: float = 1e-3
+    effective_radius_pressure_gain_m_per_bar: float = -0.0025
+
+    def resolved_gas_mass_kg(self) -> float:
+        if self.gas_mass_kg is not None:
+            return self.gas_mass_kg
+        static_abs_pressure = self.pressure_static_bar_gauge * 100_000.0 + self.atmospheric_pressure_pa
+        return (
+            static_abs_pressure
+            * self.base_volume_m3
+            / (self.gas_specific_constant_j_per_kgk * self.reference_fill_temp_k)
+        )
+
+
+@dataclass(frozen=True)
+class CoreSensorParameters:
+    probe_depth_fraction_from_outer: float = 0.22
+    width_weights: tuple[float, float, float] = (0.25, 0.50, 0.25)
+    bead_side_weight: float = 0.10
+    tread_side_weight: float = 0.20
+    belt_weight: float = 0.48
+    carcass_weight: float = 0.17
+    gas_weight: float = 0.05
+    response_time_s: float = 3.0
+    cavity_gas_comparison_fraction: float = 0.35
+
+
+@dataclass(frozen=True)
+class SurfaceStateParameters:
+    width_zones: int = 3
+    tread_thickness_fresh_m: float = 0.012
+    tread_thickness_worn_m: float = 0.004
+    tread_mass_fresh_kg: float = 3.5
+    tread_mass_worn_kg: float = 1.5
+    age_reference_temperature_k: float = celsius_to_kelvin(90.0)
+    age_temperature_gain: float = 0.035
+    age_energy_gain: float = 1.4e-5
+    graining_gain: float = 2.0e-5
+    graining_relaxation_s: float = 35.0
+    graining_cooling_temp_k: float = celsius_to_kelvin(72.0)
+    blister_gain: float = 1.6e-5
+    blister_relaxation_s: float = 60.0
+    blister_threshold_temp_k: float = celsius_to_kelvin(108.0)
+    blister_energy_gain: float = 1.1e-5
+    graining_contact_penalty: float = 0.22
+    blister_conductivity_penalty: float = 0.32
+    aging_hysteresis_shift_per_index: float = 0.18
+    wear_rate_coefficient: float = 3.4e-4
+    wear_reference_heat_w: float = 30_000.0
+
+    def tread_thickness_m(self, wear: float) -> float:
+        wear_clamped = min(max(wear, 0.0), 1.0)
+        return self.tread_thickness_fresh_m + wear_clamped * (
+            self.tread_thickness_worn_m - self.tread_thickness_fresh_m
+        )
+
+    def tread_mass_kg(self, wear: float) -> float:
+        wear_clamped = min(max(wear, 0.0), 1.0)
+        return self.tread_mass_fresh_kg + wear_clamped * (
+            self.tread_mass_worn_kg - self.tread_mass_fresh_kg
+        )
+
+
+@dataclass(frozen=True)
+class FlashLayerParameters:
+    enabled: bool = True
+    friction_fraction: float = 0.22
+    patch_relaxation_time_s: float = 0.045
+    bulk_coupling_time_s: float = 0.16
+    ambient_cooling_time_s: float = 0.80
+    road_cooling_time_s: float = 0.035
+    areal_heat_capacity_j_per_m2k: float = 1_450.0
+    max_delta_above_bulk_k: float = 85.0
+
+
+@dataclass(frozen=True)
+class BrakeCoolingParameters:
+    brake_heat_to_tire_fraction: float = 0.03
+    brake_heat_to_rim_fraction: float = 0.08
+    brake_heat_to_sidewall_fraction: float = 0.02
+    brake_disc_to_ambient_h_base_w_per_m2k: float = 65.0
+    brake_duct_cooling_gain: float = 30.0
+    wheel_wake_cooling_gain: float = 22.0
+    rim_to_ambient_h_base_w_per_m2k: float = 55.0
+    rim_to_ambient_wheel_wake_gain: float = 10.0
+
+
+@dataclass(frozen=True)
 class HighFidelityTireInputs:
-    """Inputs for the high-fidelity tire model skeleton."""
+    """Inputs for the layered high-fidelity tire model."""
 
     speed_mps: float
     wheel_angular_speed_radps: float
@@ -24,15 +200,32 @@ class HighFidelityTireInputs:
     ambient_temp_k: float = celsius_to_kelvin(25.0)
     track_temp_k: float = celsius_to_kelvin(35.0)
     wind_mps: float = 0.0
+    wind_yaw_rad: float = 0.0
     humidity_rel: float = 0.50
     solar_w_m2: float = 0.0
     road_surface_temp_k: float | None = None
     road_bulk_temp_k: float | None = None
+    road_moisture: float = 0.0
+    rubbering_level: float = 0.0
+    asphalt_roughness: float = 1.0
+    asphalt_effusivity: float = 1.0
+    brake_duct_cooling_factor: float = 1.0
+    wheel_wake_factor: float = 1.0
+    volume_change_rate_m3ps: float = 0.0
+    normal_load_rate_nps: float = 0.0
+    wheel_angular_accel_radps2: float = 0.0
+    zone_load_split: tuple[float, float, float] = (0.33, 0.34, 0.33)
+    camber_rad: float = 0.0
+    toe_rad: float = 0.0
+    lateral_accel_mps2: float = 0.0
+    longitudinal_accel_mps2: float = 0.0
+    is_left_tire: bool = True
+    is_front_tire: bool = True
 
 
 @dataclass(frozen=True)
 class HighFidelityTireModelParameters:
-    """Configuration for the high-fidelity tire model skeleton."""
+    """Configuration for the layered high-fidelity tire model."""
 
     @dataclass(frozen=True)
     class PronyBranch:
@@ -55,35 +248,26 @@ class HighFidelityTireModelParameters:
     min_excitation_frequency_hz: float = 0.20
     hysteresis_active_volume_m3: float = 2.1e-3
     use_2d_thermal_solver: bool = False
-    radial_cells: int = 24
+    enable_profiling: bool = False
+    radial_cells: int = 36
     theta_cells: int = 72
+    width_zones: int = 3
     tire_section_width_m: float = 0.33
     inner_radius_m: float = 0.230
     outer_radius_m: float = 0.340
     radial_spacing_bias: float = 2.2
-    thermal_diffusivity_m2_per_s: float = 1.6e-7
-    volumetric_heat_capacity_j_per_m3k: float = 1.9e6
     internal_solver_dt_s: float = 0.01
     advection_cfl_limit: float = 0.85
     max_solver_substeps: int = 400
-    diffusion_max_iterations: int = 120
+    diffusion_max_iterations: int = 24
     diffusion_tolerance_k: float = 1e-6
     source_patch_theta_fraction: float = 0.12
     source_patch_radial_fraction: float = 0.18
     source_volumetric_fraction: float = 0.70
-    brake_heat_to_tire_fraction: float = 0.03
-    brake_heat_to_rim_fraction: float = 0.08
-    # Assumption: the "core" telemetry available in race-tire workflows is usually an
-    # embedded under-tread / belt-package temperature, not a full-thickness carcass
-    # average and not the cavity gas temperature. Bias the proxy toward the heated
-    # outer carcass with a modest first-order lag to mimic sensor inertia.
-    core_probe_inner_fraction: float = 0.58
-    core_probe_outer_fraction: float = 0.95
-    core_probe_belt_weight: float = 0.72
-    core_probe_carcass_weight: float = 0.12
-    core_probe_gas_weight: float = 0.02
-    core_probe_response_time_s: float = 3.0
     use_wheel_coupling: bool = True
+    use_local_temp_friction_partition: bool = False
+    use_reduced_patch_mechanics: bool = False
+    use_structural_hysteresis_model: bool = False
     wheel_effective_radius_m: float = 0.330
     max_coupling_iterations: int = 8
     coupling_relaxation: float = 0.55
@@ -93,6 +277,21 @@ class HighFidelityTireModelParameters:
     coupling_angle_perturbation_rad: float = 5e-4
     max_effective_slip_ratio: float = 0.25
     max_effective_slip_angle_rad: float = 0.22
+    contact_patch_rows: int = 7
+    contact_patch_cols: int = 5
+    contact_patch_length_scale: float = 0.26
+    contact_patch_min_length_m: float = 0.055
+    contact_patch_max_length_m: float = 0.18
+    contact_patch_min_width_m: float = 0.18
+    contact_patch_max_width_m: float = 0.36
+    pressure_shape_longitudinal: float = 0.90
+    pressure_shape_lateral: float = 0.65
+    shear_stiffness_longitudinal_pa_per_m: float = 1.8e7
+    shear_stiffness_lateral_pa_per_m: float = 1.4e7
+    partial_slip_relaxation: float = 0.82
+    trailing_edge_slip_gain: float = 0.35
+    flash_temperature_weight: float = 0.72
+    mu_sliding_drop_fraction: float = 0.16
     force_mu_peak: float = 1.78
     force_mu_load_sensitivity: float = 0.12
     force_mu_temperature_peak_k: float = celsius_to_kelvin(92.0)
@@ -105,9 +304,22 @@ class HighFidelityTireModelParameters:
     lateral_force_shape: float = 1.0
     lateral_weight_gain: float = 1.0
     force_reference_speed_mps: float = 55.0
+    thermal_diffusivity_m2_per_s: float = 1.6e-7
+    volumetric_heat_capacity_j_per_m3k: float = 1.9e6
+    radial_deflection_reference_m: float = 0.018
+    belt_strain_gain: float = 0.55
+    sidewall_strain_gain: float = 0.95
+    slip_strain_gain: float = 0.30
+    pressure_strain_gain: float = 0.22
     boundary: HighFidelityBoundaryParameters = field(
         default_factory=HighFidelityBoundaryParameters
     )
+    layer_stack: LayerStackParameters = field(default_factory=LayerStackParameters)
+    pressure_patch: PressurePatchParameters = field(default_factory=PressurePatchParameters)
+    core_sensor: CoreSensorParameters = field(default_factory=CoreSensorParameters)
+    surface_state: SurfaceStateParameters = field(default_factory=SurfaceStateParameters)
+    flash_layer: FlashLayerParameters = field(default_factory=FlashLayerParameters)
+    brake_cooling: BrakeCoolingParameters = field(default_factory=BrakeCoolingParameters)
     prony_branches: tuple[PronyBranch, ...] = (
         PronyBranch(modulus_pa=7.8e6, relaxation_time_s=2.5e-3),
         PronyBranch(modulus_pa=1.15e7, relaxation_time_s=1.8e-2),
@@ -118,13 +330,27 @@ class HighFidelityTireModelParameters:
 
 @dataclass(frozen=True)
 class HighFidelityTireState:
-    """State container for the high-fidelity tire model skeleton."""
+    """State container for the layered high-fidelity tire model."""
 
     temperature_nodes_k: np.ndarray
     thermal_field_rt_k: np.ndarray | None = None
+    thermal_field_rtw_k: np.ndarray | None = None
+    flash_temperature_field_tw_k: np.ndarray | None = None
+    sidewall_field_tw_k: np.ndarray | None = None
     road_surface_temp_k: float | None = None
     road_subsurface_temp_k: float | None = None
+    road_surface_temp_w_k: np.ndarray | None = None
+    road_subsurface_temp_w_k: np.ndarray | None = None
+    road_moisture_w: np.ndarray | None = None
     wear: float = 0.0
+    age_index: float = 0.0
+    grain_index_w: np.ndarray | None = None
+    blister_index_w: np.ndarray | None = None
+    dynamic_pressure_pa: float = STANDARD_ATMOSPHERIC_PRESSURE_PA
+    dynamic_volume_m3: float = 0.0
+    contact_patch_area_m2: float = 0.0
+    zone_contact_patch_area_m2: np.ndarray | None = None
+    effective_rolling_radius_m: float = 0.0
     last_energy_residual_pct: float = 0.0
     last_solver_substeps: int = 0
     last_friction_total_w: float = 0.0
@@ -132,8 +358,10 @@ class HighFidelityTireState:
     last_friction_to_road_w: float = 0.0
     last_road_conduction_w: float = 0.0
     last_rim_conduction_w: float = 0.0
+    last_sidewall_heat_w: float = 0.0
     last_brake_heat_to_tire_w: float = 0.0
     last_brake_heat_to_rim_w: float = 0.0
+    last_brake_heat_to_sidewall_w: float = 0.0
     last_effective_bead_htc_w_per_m2k: float = 0.0
     last_effective_slip_ratio: float = 0.0
     last_effective_slip_angle_rad: float = 0.0
@@ -143,6 +371,25 @@ class HighFidelityTireState:
     last_lateral_force_residual_n: float = 0.0
     last_coupling_iterations: int = 0
     last_coupling_converged: bool = False
+    last_contact_patch_length_m: float = 0.0
+    last_contact_patch_width_m: float = 0.0
+    last_sliding_fraction: float = 0.0
+    last_effective_mu: float = 0.0
+    last_hysteresis_strain_amplitude: float = 0.0
+    last_zone_effective_mu: np.ndarray | None = None
+    last_zone_friction_power_w: np.ndarray | None = None
+    last_zone_friction_power_tire_w: np.ndarray | None = None
+    last_zone_friction_power_road_w: np.ndarray | None = None
+    last_zone_tire_heat_partition: np.ndarray | None = None
+    last_zone_sliding_fraction: np.ndarray | None = None
+    last_zone_flash_to_bulk_delta_k: np.ndarray | None = None
+    last_hysteresis_strain_by_layer: dict[str, float] = field(default_factory=dict)
+    last_hysteresis_loss_modulus_by_layer_pa: dict[str, float] = field(default_factory=dict)
+    last_hysteresis_power_by_layer_w: dict[str, float] = field(default_factory=dict)
+    last_solver_advection_time_s: float | None = None
+    last_solver_diffusion_time_s: float | None = None
+    last_solver_diffusion_iterations: int | None = None
+    last_wheel_coupling_time_s: float | None = None
     time_s: float = 0.0
 
     @property
@@ -156,7 +403,7 @@ class HighFidelityTireState:
 
 @dataclass(frozen=True)
 class HighFidelityTireDiagnostics:
-    """Diagnostics emitted by the high-fidelity tire model skeleton."""
+    """Diagnostics emitted by the layered high-fidelity tire model."""
 
     core_temperature_k: float
     core_temperature_c: float
@@ -169,7 +416,7 @@ class HighFidelityTireDiagnostics:
     energy_source_total_w: float
     energy_residual_pct: float
     solver_substeps: int
-    thermal_grid_shape: tuple[int, int] | None
+    thermal_grid_shape: tuple[int, int] | tuple[int, int, int] | None
     road_surface_temp_k: float | None
     road_subsurface_temp_k: float | None
     friction_power_total_w: float
@@ -188,3 +435,45 @@ class HighFidelityTireDiagnostics:
     lateral_force_residual_n: float
     coupling_iterations: int
     coupling_converged: bool
+    contact_patch_length_m: float = 0.0
+    contact_patch_width_m: float = 0.0
+    sliding_fraction: float = 0.0
+    effective_mu: float = 0.0
+    hysteresis_strain_amplitude: float = 0.0
+    per_zone_effective_mu: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_zone_friction_power_w: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_zone_friction_power_tire_w: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_zone_friction_power_road_w: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_zone_tire_heat_partition: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_zone_sliding_fraction: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_zone_flash_to_bulk_delta_k: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    hysteresis_strain_by_layer: dict[str, float] = field(default_factory=dict)
+    hysteresis_loss_modulus_by_layer_pa: dict[str, float] = field(default_factory=dict)
+    hysteresis_power_by_layer_w: dict[str, float] = field(default_factory=dict)
+    bulk_core_temperature_k: float | None = None
+    cavity_gas_temperature_k: float | None = None
+    core_temperature_compare_k: float | None = None
+    flash_surface_temperature_k: float | None = None
+    dynamic_pressure_pa: float = STANDARD_ATMOSPHERIC_PRESSURE_PA
+    dynamic_pressure_bar_gauge: float = 0.0
+    dynamic_volume_m3: float = 0.0
+    contact_patch_area_m2: float = 0.0
+    zone_contact_patch_area_m2: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    effective_rolling_radius_m: float = 0.0
+    per_width_surface_temp_k: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_width_flash_surface_temp_k: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    per_width_bulk_temp_k: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    layer_mean_temp_k: dict[str, float] = field(default_factory=dict)
+    road_surface_temp_w_k: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    road_subsurface_temp_w_k: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    road_moisture_w: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    age_index: float = 0.0
+    grain_index_w: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    blister_index_w: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    brake_heat_to_sidewall_w: float = 0.0
+    brake_duct_cooling_factor: float = 1.0
+    wheel_wake_factor: float = 1.0
+    solver_advection_time_s: float | None = None
+    solver_diffusion_time_s: float | None = None
+    solver_diffusion_iterations: int | None = None
+    wheel_coupling_time_s: float | None = None

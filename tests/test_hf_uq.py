@@ -81,10 +81,11 @@ def test_p7_lhs_screen_returns_deterministic_envelopes() -> None:
     priors = uq.default_tire_priors()
 
     def model_fn(sample: dict[str, float]) -> np.ndarray:
-        x = sample["thermal_diffusivity_m2_per_s"] * 1.0e7
+        x = sample["layer_stack.tread.k_r_w_per_mk"] * 10.0
         y = sample["boundary.eta_tire"]
         z = sample["force_mu_peak"]
-        return np.array([x + y, z - y, x * 0.1 + z], dtype=float)
+        w = sample["core_sensor.probe_depth_fraction_from_outer"]
+        return np.array([x + y, z - y, x * 0.1 + z + w], dtype=float)
 
     first = uq.lhs_screen(priors=priors, model_fn=model_fn, sample_count=64, seed=77)
     second = uq.lhs_screen(priors=priors, model_fn=model_fn, sample_count=64, seed=77)
