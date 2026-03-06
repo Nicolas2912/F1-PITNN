@@ -1,0 +1,48 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.coverage
+.coverage.*
+.hypothesis/
+.ipynb_checkpoints/
+.mypy_cache/
+.nox/
+.pyre/
+.pytest_cache/
+.ruff_cache/
+.tox/
+build/
+dist/
+htmlcov/
+site/
+
+# Virtual environments and local Python config
+.python-version
+.venv/
+venv/
+env/
+ENV/
+
+# Tooling caches
+.cache/
+pip-wheel-metadata/
+var/uv-cache/
+
+# Project-generated data and reports
+data/raw/
+data/processed/
+reports/figures/
+reports/results/
+
+# Local notebooks, logs, and temp files
+*.log
+*.tmp
