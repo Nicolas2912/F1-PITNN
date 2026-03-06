@@ -198,7 +198,7 @@ class ThermalFieldSolver2D:
         return params.inner_radius_m + stretched * (params.outer_radius_m - params.inner_radius_m)
 
     def _build_cell_volumes_m3(self) -> np.ndarray:
-        width_m = 1.0
+        width_m = max(self.parameters.tire_section_width_m, 1e-3)
         radial_cells = self.parameters.radial_cells
         theta_cells = self.parameters.theta_cells
         volumes = np.zeros((radial_cells, theta_cells), dtype=float)

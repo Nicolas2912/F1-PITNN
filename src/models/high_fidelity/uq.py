@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass, replace
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, TypeVar, cast
 
 import numpy as np
 
 from .types import HighFidelityTireModelParameters
+
+
+class DataclassInstance(Protocol):
+    __dataclass_fields__: dict[str, Any]
+
+
+DataclassT = TypeVar("DataclassT", bound=DataclassInstance)
 
 
 @dataclass(frozen=True)
@@ -272,24 +279,28 @@ class HighFidelityUQ:
 
     def _replace_dataclass_path(
         self,
-        obj: Any,
+        obj: DataclassT,
         path_parts: list[str],
         value: float,
-    ) -> Any:
+    ) -> DataclassT:
         if not is_dataclass(obj):
             msg = f"Expected dataclass while applying {'.'.join(path_parts)}"
             raise TypeError(msg)
+        dataclass_obj: Any = obj
         field_name = path_parts[0]
-        dataclass_field_names = {field.name for field in fields(obj)}
+        dataclass_field_names = {field.name for field in fields(dataclass_obj)}
         if field_name not in dataclass_field_names:
             msg = f"Unknown dataclass field {field_name} on {type(obj).__name__}"
             raise ValueError(msg)
 
         if len(path_parts) == 1:
-            return replace(obj, **{field_name: value})
+            return cast(DataclassT, replace(dataclass_obj, **{field_name: value}))
 
         nested = getattr(obj, field_name)
-        return replace(
-            obj,
-            **{field_name: self._replace_dataclass_path(nested, path_parts[1:], value)},
+        return cast(
+            DataclassT,
+            replace(
+                dataclass_obj,
+                **{field_name: self._replace_dataclass_path(cast(DataclassT, nested), path_parts[1:], value)},
+            ),
         )

@@ -57,6 +57,7 @@ class HighFidelityTireModelParameters:
     use_2d_thermal_solver: bool = False
     radial_cells: int = 24
     theta_cells: int = 72
+    tire_section_width_m: float = 0.33
     inner_radius_m: float = 0.230
     outer_radius_m: float = 0.340
     radial_spacing_bias: float = 2.2

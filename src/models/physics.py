@@ -250,7 +250,7 @@ class TireModelParameters:
     slip_ratio_reference: float = 0.11
     slip_angle_reference_rad: float = 0.09
     toe_slip_gain: float = 0.45
-    friction_heat_fraction: float = 0.15
+    friction_heat_fraction: float = 0.72
 
     # Rolling resistance and sidewall split model.
     rolling_resistance_coeff: float = 0.0018
@@ -321,7 +321,7 @@ class TireModelParameters:
     min_external_htc_w_per_m2k: float = 8.0
     zone_external_h_multipliers: tuple[float, float, float] = (1.30, 1.0, 0.95)
     exposed_surface_area_m2: float = 0.24
-    track_contact_htc_w_per_m2k: float = 180.0
+    track_contact_htc_w_per_m2k: float = 2_600.0
     surface_emissivity: float = 0.94
     tread_to_belt_area_fraction: float = 0.32
     zone_lateral_conductance_w_per_k: float = 18.0
@@ -337,7 +337,7 @@ class TireModelParameters:
     gas_mixing_time_constant_s: float = 0.35
     gas_mixing_floor: float = 0.24
     min_internal_htc_w_per_m2k: float = 8.0
-    max_internal_htc_w_per_m2k: float = 125.0
+    max_internal_htc_w_per_m2k: float = 180.0
 
     # Hysteresis and wear.
     loss_tangent: float = 0.30
@@ -658,13 +658,23 @@ class TireThermalSimulator:
             slip_utilization = 1.0 - math.exp(-params.combined_slip_shape * slip_mag)
             friction_force_total = mu_eff * max(inputs.normal_load_n, 0.0) * slip_utilization
             q_friction_total = friction_force_total * diag.slip_speed_mps
-            q_friction_base = self._friction_power_to_tire(tuple(q_friction_total * w for w in zone_weights))
+            q_friction_base = self._friction_power_to_tire(
+                (
+                    q_friction_total * zone_weights[0],
+                    q_friction_total * zone_weights[1],
+                    q_friction_total * zone_weights[2],
+                )
+            )
         else:
             tau_shear_pa = params.base_shear_stress_pa * (0.2 + slip_factor)
             tau_shear_pa *= 1.0 + params.shear_load_gain * (load_ratio - 1.0)
             tau_shear_pa *= heating_factor
             q_friction_base = self._friction_power_to_tire(
-                tuple(tau_shear_pa * a * diag.slip_speed_mps for a in diag.zone_contact_areas_m2)
+                (
+                    tau_shear_pa * diag.zone_contact_areas_m2[0] * diag.slip_speed_mps,
+                    tau_shear_pa * diag.zone_contact_areas_m2[1] * diag.slip_speed_mps,
+                    tau_shear_pa * diag.zone_contact_areas_m2[2] * diag.slip_speed_mps,
+                )
             )
 
         q_convection = tuple(
@@ -746,17 +756,12 @@ class TireThermalSimulator:
         if params.use_friction_partition_model:
             c_adh, c_hys_surf, c_flash = self._friction_partition_coefficients()
             q_friction_adh = tuple(c_adh * q for q in q_friction_base)
-            q_friction_hys_surf = tuple(c_hys_surf * q for q in q_friction_base)
+            q_friction_hys_belt = tuple(c_hys_surf * q for q in q_friction_base)
             q_friction_flash = tuple(c_flash * q for q in q_friction_base)
-            flash_sink_time_s = max(params.flash_surface_time_constant_s, 1e-3)
-            q_flash_surface_sink = tuple(
-                min(
-                    q_flash,
-                    max(storage * max(t_surface - inputs.ambient_temp_k, 0.0) / flash_sink_time_s, 0.0),
-                )
-                for q_flash, storage, t_surface in zip(
-                    q_friction_flash,
-                    surface_storage,
+            flash_track_capacity = tuple(
+                params.track_contact_htc_w_per_m2k * area * max(t_surface - inputs.track_temp_k, 0.0)
+                for area, t_surface in zip(
+                    diag.zone_contact_areas_m2,
                     (
                         state.t_surface_inner_k,
                         state.t_surface_middle_k,
@@ -765,18 +770,27 @@ class TireThermalSimulator:
                     strict=True,
                 )
             )
-            q_friction = tuple(
-                q_adh + q_hys + q_flash - q_sink
-                for q_adh, q_hys, q_flash, q_sink in zip(
-                    q_friction_adh,
-                    q_friction_hys_surf,
+            q_flash_to_track = tuple(
+                min(q_flash, q_capacity)
+                for q_flash, q_capacity in zip(
                     q_friction_flash,
-                    q_flash_surface_sink,
+                    flash_track_capacity,
+                    strict=True,
+                )
+            )
+            q_friction = tuple(
+                q_adh + (q_flash - q_track)
+                for q_adh, q_flash, q_track in zip(
+                    q_friction_adh,
+                    q_friction_flash,
+                    q_flash_to_track,
                     strict=True,
                 )
             )
         else:
             q_friction = q_friction_base
+            q_friction_hys_belt = (0.0, 0.0, 0.0)
+            q_flash_to_track = (0.0, 0.0, 0.0)
 
         dt_surface = (
             (
@@ -784,6 +798,7 @@ class TireThermalSimulator:
                 - q_convection[0]
                 - q_radiation[0]
                 - q_track[0]
+                - q_flash_to_track[0]
                 - q_surface_to_belt[0]
                 - q_inner_to_middle
             )
@@ -793,6 +808,7 @@ class TireThermalSimulator:
                 - q_convection[1]
                 - q_radiation[1]
                 - q_track[1]
+                - q_flash_to_track[1]
                 - q_surface_to_belt[1]
                 + q_inner_to_middle
                 + q_outer_to_middle
@@ -803,6 +819,7 @@ class TireThermalSimulator:
                 - q_convection[2]
                 - q_radiation[2]
                 - q_track[2]
+                - q_flash_to_track[2]
                 - q_surface_to_belt[2]
                 - q_outer_to_middle
             )
@@ -858,6 +875,7 @@ class TireThermalSimulator:
             q_surfaces_to_belt
             + q_hysteresis_belt
             + q_rr_belt_tread
+            + sum(q_friction_hys_belt)
             - q_belt_to_carcass
             - q_belt_to_rim
         ) / max(params.m_belt_kg * params.c_belt_j_per_kgk, 1.0)
@@ -1108,7 +1126,11 @@ class TireThermalSimulator:
         zone_friction_power_mechanical_w: tuple[float, float, float],
     ) -> tuple[float, float, float]:
         heat_fraction = max(self.parameters.friction_heat_fraction, 0.0)
-        return tuple(heat_fraction * q for q in zone_friction_power_mechanical_w)
+        return (
+            heat_fraction * zone_friction_power_mechanical_w[0],
+            heat_fraction * zone_friction_power_mechanical_w[1],
+            heat_fraction * zone_friction_power_mechanical_w[2],
+        )
 
     def _rolling_resistance_heating_w(self, inputs: TireInputs) -> tuple[float, float, float]:
         params = self.parameters
@@ -1200,11 +1222,12 @@ class TireThermalSimulator:
     ) -> float:
         params = self.parameters
         gas_density = pressure_pa / max(params.gas_specific_constant_j_per_kgk * gas_temp_k, 1e-6)
-        flow_speed_mps = abs(wheel_speed_radps) * (params.internal_flow_diameter_m * 0.5)
+        # Cavity mixing is driven by the annular gas gap shear, not the full tire diameter.
+        flow_speed_mps = abs(wheel_speed_radps) * params.internal_gas_gap_m
         reynolds_internal = (
             gas_density
             * flow_speed_mps
-            * params.internal_flow_diameter_m
+            * params.internal_gas_gap_m
             / max(params.gas_dynamic_viscosity_pa_s, 1e-10)
         )
         if params.use_rotating_internal_gas_model:

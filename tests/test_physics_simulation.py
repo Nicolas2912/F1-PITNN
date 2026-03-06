@@ -362,7 +362,7 @@ def test_phase4_friction_partition_normalization_and_conservation() -> None:
     assert math.isclose(diag.friction_power_flash_w / diag.friction_power_total_w, 0.3125, rel_tol=1e-9)
 
 
-def test_phase4_flash_partition_reduces_belt_heating_rate() -> None:
+def test_phase4_flash_partition_limits_surface_heating_response() -> None:
     baseline_params = TireModelParameters(
         use_quasi_2d_patch_model=True,
         use_friction_partition_model=False,
@@ -392,4 +392,4 @@ def test_phase4_flash_partition_reduces_belt_heating_rate() -> None:
         baseline_state = baseline_sim.step(baseline_state, control, dt_s=0.1)
         flash_state = flash_sim.step(flash_state, control, dt_s=0.1)
 
-    assert flash_state.t_belt_k < baseline_state.t_belt_k
+    assert flash_state.t_surface_middle_k < baseline_state.t_surface_middle_k
