@@ -308,7 +308,7 @@ def _batched(items: list[object], batch_size: int) -> list[list[object]]:
 
 
 def _batch_size(item_count: int, workers: int) -> int:
-    return max(1, item_count // max(workers * 4, 1))
+    return max(1, (item_count + max(workers, 1) - 1) // max(workers, 1))
 
 
 def _iter_process_pool_map(worker_fn, tasks: list[dict], workers: int):
@@ -727,10 +727,10 @@ def run_lhs_uq(
     if progress_tracker is not None:
         progress_tracker.set_phase("lhs")
     if workers > 1 and lhs_samples > 1:
+        batched_payloads = _batched(sample_payloads, _batch_size(lhs_samples, workers))
         tasks = [
             {
-                "sample_idx": sample_idx,
-                "sample": sample,
+                "batch": batch,
                 "scenarios": scenarios,
                 "scenario_inputs": scenario_inputs,
                 "tire_parameters": tire_parameters,
@@ -738,12 +738,12 @@ def run_lhs_uq(
                 "dt_s": dt_s,
                 "diagnostics_stride": diagnostics_stride,
             }
-            for sample_idx, sample in sample_payloads
+            for batch in batched_payloads
         ]
-        for sample_result in _iter_process_pool_map(_evaluate_lhs_sample, tasks, workers):
-            lhs_results.append(sample_result)
+        for batch_result in _iter_process_pool_map(_evaluate_lhs_batch, tasks, workers):
+            lhs_results.extend(batch_result)
             if progress_tracker is not None:
-                progress_tracker.advance(1)
+                progress_tracker.advance(len(batch_result))
     else:
         lhs_results = _evaluate_lhs_batch(
             {

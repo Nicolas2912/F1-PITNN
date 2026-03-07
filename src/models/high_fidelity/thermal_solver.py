@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 
+from .native_diffusion import native_diffusion_available, native_diffusion_enabled, run_native_diffuse_vectorized_implicit
 from .types import HighFidelityTireInputs, HighFidelityTireModelParameters
 
 
@@ -485,6 +486,44 @@ class ThermalFieldSolver2D:
         return (1.0 - frac) * primary + frac * secondary
 
     def _diffuse_vectorized_implicit(
+        self,
+        field: np.ndarray,
+        *,
+        source_w_per_m3: np.ndarray,
+        rho_cp: np.ndarray,
+        k_r: np.ndarray,
+        k_theta: np.ndarray,
+        k_w: np.ndarray,
+        dt_s: float,
+    ) -> tuple[np.ndarray, int]:
+        if native_diffusion_enabled() and native_diffusion_available():
+            return run_native_diffuse_vectorized_implicit(
+                field=field,
+                source_w_per_m3=source_w_per_m3,
+                rho_cp=rho_cp,
+                k_r=k_r,
+                k_theta=k_theta,
+                k_w=k_w,
+                dt_s=dt_s,
+                radial_coeff_minus=self._radial_coeff_minus,
+                radial_coeff_plus=self._radial_coeff_plus,
+                theta_coeff=self._theta_coeff,
+                width_coeff_minus=self._width_coeff_minus,
+                width_coeff_plus=self._width_coeff_plus,
+                diffusion_max_iterations=int(self.parameters.diffusion_max_iterations),
+                diffusion_tolerance_k=float(self.parameters.diffusion_tolerance_k),
+            )
+        return self._diffuse_vectorized_implicit_python(
+            field,
+            source_w_per_m3=source_w_per_m3,
+            rho_cp=rho_cp,
+            k_r=k_r,
+            k_theta=k_theta,
+            k_w=k_w,
+            dt_s=dt_s,
+        )
+
+    def _diffuse_vectorized_implicit_python(
         self,
         field: np.ndarray,
         *,
