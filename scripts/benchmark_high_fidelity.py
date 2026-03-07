@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -24,6 +25,25 @@ BENCHMARK_CONFIG = {
     "sobol_samples": 6,
     "seed": 2026,
 }
+
+
+class _EnvVar:
+    def __init__(self, key: str, value: str | None) -> None:
+        self._key = key
+        self._value = value
+        self._old = os.environ.get(key)
+
+    def __enter__(self) -> None:
+        if self._value is None:
+            os.environ.pop(self._key, None)
+        else:
+            os.environ[self._key] = self._value
+
+    def __exit__(self, *_args: object) -> None:
+        if self._old is None:
+            os.environ.pop(self._key, None)
+        else:
+            os.environ[self._key] = self._old
 
 
 def _load_run_module():
@@ -140,6 +160,37 @@ def _bench_harness() -> dict[str, float]:
     }
 
 
+def _bench_native_harness() -> dict[str, float]:
+    run_module = _load_run_module()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        python_runs = []
+        native_runs = []
+        for idx in range(3):
+            with _EnvVar("PITNN_USE_NATIVE_DIFFUSION", None), _EnvVar("PITNN_USE_NATIVE_SIMULATOR_KERNELS", None):
+                python_runs.append(_run_harness_once(run_module, tmp, workers=1, suffix=f"python_{idx}"))
+            with _EnvVar("PITNN_USE_NATIVE_DIFFUSION", "1"), _EnvVar("PITNN_USE_NATIVE_SIMULATOR_KERNELS", "1"):
+                native_runs.append(_run_harness_once(run_module, tmp, workers=1, suffix=f"native_{idx}"))
+        for run in native_runs:
+            _assert_equivalent_outputs(python_runs[0], run)
+        for run in python_runs[1:]:
+            _assert_equivalent_outputs(python_runs[0], run)
+
+    python_median = statistics.median(run["runtime_s"] for run in python_runs)
+    native_median = statistics.median(run["runtime_s"] for run in native_runs)
+    improvement_s = python_median - native_median
+    improvement_pct = (improvement_s / python_median) * 100.0 if python_median > 0.0 else 0.0
+    if improvement_pct < 1.0:
+        msg = f"Expected at least 1% native harness speedup, got {improvement_pct:.2f}%"
+        raise RuntimeError(msg)
+    return {
+        "python_runtime_median_s": python_median,
+        "native_runtime_median_s": native_median,
+        "improvement_s": improvement_s,
+        "improvement_pct": improvement_pct,
+    }
+
+
 def _normalize_artifact(payload: dict) -> dict:
     normalized = json.loads(json.dumps(payload))
     metadata = normalized.get("metadata", {})
@@ -190,6 +241,7 @@ def main() -> None:
         "tire_step": _bench_tire_step(),
         "vehicle_step": _bench_vehicle_step(),
         "harness": _bench_harness(),
+        "native_harness": _bench_native_harness(),
     }
     print(json.dumps(payload, indent=2))
 

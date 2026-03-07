@@ -1082,7 +1082,7 @@ class HighFidelityTireSimulator:
         if not params.enabled:
             return np.repeat(bulk_surface_tw[None, :], self.parameters.theta_cells, axis=0)
 
-        surface_cell_areas = self._thermal_solver.surface_cell_areas_m2
+        surface_cell_areas = self._thermal_solver._surface_cell_areas_m2
         _, theta_indices, width_indices = self._thermal_solver.contact_patch_indices(
             wheel_angular_speed_radps=wheel_angular_speed_radps,
             time_s=time_s,
@@ -1096,8 +1096,8 @@ class HighFidelityTireSimulator:
                 bulk_surface_w_k=bulk_surface_tw,
                 road_surface_temp_w_k=road_state.road_surface_temp_w_k,
                 zone_weights=zone_weights,
-                theta_indices=np.asarray(theta_indices, dtype=int),
-                width_indices=np.asarray(width_indices, dtype=int),
+                theta_indices=theta_indices,
+                width_indices=width_indices,
                 ambient_temp_k=ambient_temp_k,
                 friction_to_tire_w=friction_to_tire_w,
                 friction_fraction=flash_fraction,

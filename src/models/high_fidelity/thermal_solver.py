@@ -6,7 +6,12 @@ import time
 
 import numpy as np
 
-from .native_diffusion import native_diffusion_available, native_diffusion_enabled, run_native_diffuse_vectorized_implicit
+from .native_diffusion import (
+    native_diffusion_available,
+    native_diffusion_enabled,
+    run_native_build_source_and_diffuse_implicit,
+    run_native_diffuse_vectorized_implicit,
+)
 from .types import HighFidelityTireInputs, HighFidelityTireModelParameters
 
 
@@ -325,7 +330,7 @@ class ThermalFieldSolver2D:
         if extra_source_w_per_m3 is not None:
             self._validate_field_shape(extra_source_w_per_m3)
 
-        rho_cp, k_r, k_theta, k_w, _ = self.layer_property_maps(
+        rho_cp, k_r, k_theta, k_w, layer_index = self.layer_property_maps(
             wear=wear,
             grain_index_w=grain_index_w,
             blister_index_w=blister_index_w,
@@ -346,33 +351,64 @@ class ThermalFieldSolver2D:
         diffusion_iterations = 0
         for sub_idx in range(substeps):
             t_sub = time_s + sub_idx * dt_sub
-            source = self.source_field_w_per_m3(
-                volumetric_source_w_per_m3=volumetric_source_w_per_m3,
-                wheel_angular_speed_radps=omega,
-                time_s=t_sub,
-                zone_weights=zone_source_weights,
-                layer_source_weights=layer_source_weights,
-            )
-            if extra_source_w_per_m3 is not None:
-                source = source + extra_source_w_per_m3
-            expected_energy_j += dt_sub * self._total_source_power_w(source)
-
             start = time.perf_counter() if self.parameters.enable_profiling else 0.0
             field = self._advect_theta_periodic(field, omega=omega, dt_s=dt_sub)
             if self.parameters.enable_profiling:
                 advection_time_s += time.perf_counter() - start
 
-            start = time.perf_counter() if self.parameters.enable_profiling else 0.0
-            field, substep_iterations = self._diffuse_vectorized_implicit(
-                field,
-                source_w_per_m3=source,
-                rho_cp=rho_cp,
-                k_r=k_r,
-                k_theta=k_theta,
-                k_w=k_w,
-                dt_s=dt_sub,
-            )
+            if native_diffusion_enabled() and native_diffusion_available():
+                start = time.perf_counter() if self.parameters.enable_profiling else 0.0
+                field, substep_iterations, source = run_native_build_source_and_diffuse_implicit(
+                    field=field,
+                    extra_source_w_per_m3=extra_source_w_per_m3,
+                    rho_cp=rho_cp,
+                    k_r=k_r,
+                    k_theta=k_theta,
+                    k_w=k_w,
+                    dt_s=dt_sub,
+                    radial_coeff_minus=self._radial_coeff_minus,
+                    radial_coeff_plus=self._radial_coeff_plus,
+                    theta_coeff=self._theta_coeff,
+                    width_coeff_minus=self._width_coeff_minus,
+                    width_coeff_plus=self._width_coeff_plus,
+                    diffusion_max_iterations=int(self.parameters.diffusion_max_iterations),
+                    diffusion_tolerance_k=float(self.parameters.diffusion_tolerance_k),
+                    source_volumetric_fraction=float(self.parameters.source_volumetric_fraction),
+                    volumetric_source_w_per_m3=float(volumetric_source_w_per_m3),
+                    wheel_angular_speed_radps=float(omega),
+                    time_s=float(t_sub),
+                    theta_delta_rad=float(self._theta_delta_rad),
+                    patch_radial_indices=self._patch_radial_indices,
+                    theta_offsets=self._theta_offsets,
+                    width_indices=self._width_indices,
+                    layer_index=layer_index,
+                    zone_weights=zone_source_weights,
+                    layer_source_weights=self._layer_source_weights_array(layer_source_weights),
+                )
+            else:
+                source = self.source_field_w_per_m3(
+                    volumetric_source_w_per_m3=volumetric_source_w_per_m3,
+                    wheel_angular_speed_radps=omega,
+                    time_s=t_sub,
+                    zone_weights=zone_source_weights,
+                    layer_source_weights=layer_source_weights,
+                )
+                if extra_source_w_per_m3 is not None:
+                    source = source + extra_source_w_per_m3
+
+                start = time.perf_counter() if self.parameters.enable_profiling else 0.0
+                field, substep_iterations = self._diffuse_vectorized_implicit(
+                    field,
+                    source_w_per_m3=source,
+                    rho_cp=rho_cp,
+                    k_r=k_r,
+                    k_theta=k_theta,
+                    k_w=k_w,
+                    dt_s=dt_sub,
+                )
+
             diffusion_iterations += substep_iterations
+            expected_energy_j += dt_sub * self._total_source_power_w(source)
             if self.parameters.enable_profiling:
                 diffusion_time_s += time.perf_counter() - start
             np.clip(field, self.parameters.minimum_temperature_k, self.parameters.maximum_temperature_k, out=field)
@@ -588,6 +624,23 @@ class ThermalFieldSolver2D:
 
     def _total_source_power_w(self, source_w_per_m3: np.ndarray) -> float:
         return float(np.sum(source_w_per_m3 * self._cell_volumes_m3))
+
+    def _layer_source_weights_array(
+        self,
+        layer_source_weights: dict[str, float] | None,
+    ) -> np.ndarray | None:
+        if not layer_source_weights:
+            return None
+        return np.asarray(
+            [
+                max(float(layer_source_weights.get("tread", 0.0)), 0.0),
+                max(float(layer_source_weights.get("belt", 0.0)), 0.0),
+                max(float(layer_source_weights.get("carcass", 0.0)), 0.0),
+                max(float(layer_source_weights.get("sidewall", 0.0)), 0.0),
+                max(float(layer_source_weights.get("inner_liner", 0.0)), 0.0),
+            ],
+            dtype=float,
+        )
 
     def _construction_conductivity_scale(
         self,
