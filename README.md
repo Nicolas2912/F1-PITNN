@@ -1,85 +1,99 @@
 # PITNN
 
-Physics-informed neural network project scaffold for 5-second-ahead tire core temperature prediction.
+Physics-informed tire thermal simulation project with a stable legacy model and a higher-fidelity simulation path.
 
-## Environment
-- Python: `3.14.x` (newest currently compatible baseline used here)
-- Package manager: [`uv`](https://github.com/astral-sh/uv)
+## Current Status
+- Implemented and tested: legacy 9-node tire thermal model (`src/models/physics.py`)
+- Implemented and tested: 4-wheel vehicle thermal simulator (`src/models/vehicle_thermal.py`)
+- Implemented and tested: high-fidelity simulation stack (`src/models/high_fidelity/`)
+- Implemented and tested: no-data scenario/UQ harness and performance benchmarks (`scripts/`)
+- Not implemented yet: training, evaluation, and sweep entrypoints (`src/train/*.py` are placeholders)
+
+Canonical architecture notes are in [`simulation_model.md`](simulation_model.md).
+
+## Requirements
+- Python `>=3.14,<3.15`
+- [`uv`](https://github.com/astral-sh/uv)
 
 ## Setup
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache-pitnn uv sync --dev
 ```
 
-## Quick Checks
+## Quick Validation
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run python -c "import fastf1, hydra, numpy, pandas, pydantic, requests_cache, retry_requests, rich, tqdm"
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run pitnn
 UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run pytest
 UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run ruff check .
 UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run mypy src
 ```
 
-## Physics Tire Simulation (9-Node)
-`src/models/physics.py` implements a pressure-coupled 9-node thermal model (surface I/M/O, belt, carcass,
-gas, rim, brake, sidewall) with:
-- wear-dependent tread thickness and mass
-- pressure/volume feedback for contact patch updates
-- `P*dV` compression work in the gas node
-- external and internal convection correlations
+`pytest` is configured to skip `slow` tests by default. To include slow tests:
 
-Minimal usage:
-```python
-from models.physics import TireInputs, TireThermalSimulator, celsius_to_kelvin
-
-sim = TireThermalSimulator()
-state = sim.initial_state(ambient_temp_k=celsius_to_kelvin(30.0))
-u = TireInputs(
-    speed_mps=70.0,
-    wheel_angular_speed_radps=210.0,
-    normal_load_n=3800.0,
-    slip_ratio=0.08,
-    slip_angle_rad=0.05,
-    brake_power_w=3000.0,
-    ambient_temp_k=celsius_to_kelvin(30.0),
-    track_temp_k=celsius_to_kelvin(44.0),
-)
-for _ in range(300):
-    state = sim.step(state, u, dt_s=0.1)
-
-print("Core temperature [C]:", state.core_temperature_c)
-print("Pressure [bar(g)]:", sim.diagnostics(state, u).dynamic_pressure_bar_gauge)
+```bash
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run pytest -m "slow or not slow"
 ```
 
-## High-Fidelity Simulation
-`src/models/high_fidelity/` adds the non-breaking high-fidelity path:
-- 2D radial x circumferential thermal solver
-- Prony + WLF hysteresis model
-- road and rim boundary heat transfer
-- brake heat leakage into tire/rim
-- under-tread core-probe assumption with finite sensor lag
-- closed-loop wheel slip/force coupling
-- 4-wheel vehicle orchestration
-- uncertainty envelopes and Sobol ranking via `scripts/run_high_fidelity_no_data.py`
-- deterministic long-stint validation alongside the short benchmark maneuvers
+## High-Fidelity Harness
+Run the synthetic no-data high-fidelity scenarios (deterministic + UQ):
 
-The canonical architecture and modeling assumptions live in
-[`simulation_model.md`](simulation_model.md).
+```bash
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run python scripts/run_high_fidelity_no_data.py --preset dev --workers 1
+```
+
+Useful presets:
+- `smoke`: quickest sanity run
+- `dev`: development-time compromise
+- `full`: highest default fidelity
+
+Default outputs:
+- JSON: `reports/results/high_fidelity_no_data_results.json`
+- Markdown summary: `reports/results/high_fidelity_no_data_summary.md`
+
+## Optional Native Acceleration
+Build optional C++/pybind11 kernels:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run python scripts/build_hf_diffusion_native.py
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run python scripts/build_hf_simulator_native.py
+```
+
+Enable native kernels at runtime:
+
+```bash
+export PITNN_USE_NATIVE_DIFFUSION=1
+export PITNN_USE_NATIVE_SIMULATOR_KERNELS=1
+```
+
+## Benchmarks
+```bash
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run python scripts/benchmark_high_fidelity.py
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run python scripts/benchmark_diffusion_kernel.py
+UV_CACHE_DIR=/tmp/uv-cache-pitnn uv run python scripts/benchmark_simulator_kernels.py
+```
+
+`benchmark_high_fidelity.py` enforces deterministic equivalence and requires at least a 1% speedup in its parallel/native checks.
 
 ## Repository Layout
 ```text
 PITNN/
+  configs/
   data/
     raw/
     processed/
-  notebooks/
-  src/
-    data/
-    models/
-    train/
-    utils/
-  configs/
+  native/
   reports/
     figures/
     results/
+  scripts/
+  src/
+    data/
+    models/
+    pitnn/
+    train/
+    utils/
   tests/
 ```
+
+## License
+This project is licensed under the MIT License. See [`LICENSE`](LICENSE).
