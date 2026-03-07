@@ -571,7 +571,6 @@ def run_scenario_pack(
     if progress_tracker is not None:
         progress_tracker.set_phase("baseline")
     if workers > 1 and len(scenarios) > 1:
-        scenario_order = {scenario.name: idx for idx, scenario in enumerate(scenarios)}
         tasks = [
             {
                 "scenario": scenario,
@@ -584,15 +583,15 @@ def run_scenario_pack(
             }
             for scenario in scenarios
         ]
-        scenario_results = sorted(
-            _iter_process_pool_map(_run_scenario_task, tasks, workers=min(workers, len(tasks))),
-            key=lambda item: scenario_order[item[0]],
-        )
-        for scenario_name, result in scenario_results:
-            scenario_traces[scenario_name] = result["trace"]
-            scenario_summaries[scenario_name] = result["summary"]
+        scenario_results_by_name: dict[str, dict] = {}
+        for scenario_name, result in _iter_process_pool_map(_run_scenario_task, tasks, workers=min(workers, len(tasks))):
+            scenario_results_by_name[scenario_name] = result
             if progress_tracker is not None:
                 progress_tracker.advance(1)
+        for scenario in scenarios:
+            result = scenario_results_by_name[scenario.name]
+            scenario_traces[scenario.name] = result["trace"]
+            scenario_summaries[scenario.name] = result["summary"]
     else:
         for scenario in scenarios:
             result = run_single_scenario(
@@ -727,10 +726,10 @@ def run_lhs_uq(
     if progress_tracker is not None:
         progress_tracker.set_phase("lhs")
     if workers > 1 and lhs_samples > 1:
-        batched_payloads = _batched(sample_payloads, _batch_size(lhs_samples, workers))
         tasks = [
             {
-                "batch": batch,
+                "sample_idx": sample_idx,
+                "sample": sample,
                 "scenarios": scenarios,
                 "scenario_inputs": scenario_inputs,
                 "tire_parameters": tire_parameters,
@@ -738,26 +737,30 @@ def run_lhs_uq(
                 "dt_s": dt_s,
                 "diagnostics_stride": diagnostics_stride,
             }
-            for batch in batched_payloads
+            for sample_idx, sample in sample_payloads
         ]
-        for batch_result in _iter_process_pool_map(_evaluate_lhs_batch, tasks, workers):
-            lhs_results.extend(batch_result)
+        for sample_result in _iter_process_pool_map(_evaluate_lhs_sample, tasks, workers):
+            lhs_results.append(sample_result)
             if progress_tracker is not None:
-                progress_tracker.advance(len(batch_result))
+                progress_tracker.advance(1)
     else:
-        lhs_results = _evaluate_lhs_batch(
-            {
-                "batch": sample_payloads,
-                "scenarios": scenarios,
-                "scenario_inputs": scenario_inputs,
-                "tire_parameters": tire_parameters,
-                "vehicle_parameters": vehicle_parameters,
-                "dt_s": dt_s,
-                "diagnostics_stride": diagnostics_stride,
-            }
-        )
-        if progress_tracker is not None:
-            progress_tracker.advance(len(lhs_results))
+        for sample_idx, sample in sample_payloads:
+            lhs_results.append(
+                _evaluate_lhs_sample(
+                    {
+                        "sample_idx": sample_idx,
+                        "sample": sample,
+                        "scenarios": scenarios,
+                        "scenario_inputs": scenario_inputs,
+                        "tire_parameters": tire_parameters,
+                        "vehicle_parameters": vehicle_parameters,
+                        "dt_s": dt_s,
+                        "diagnostics_stride": diagnostics_stride,
+                    }
+                )
+            )
+            if progress_tracker is not None:
+                progress_tracker.advance(1)
 
     lhs_results.sort(key=lambda item: item[0])
     for _sample_idx, sample_result in lhs_results:

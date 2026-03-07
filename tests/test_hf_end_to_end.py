@@ -52,6 +52,18 @@ def _normalized_summary(text: str) -> str:
     )
 
 
+class _RecordingProgressTracker:
+    def __init__(self) -> None:
+        self.phases: list[str] = []
+        self.advances: list[int] = []
+
+    def set_phase(self, label: str) -> None:
+        self.phases.append(label)
+
+    def advance(self, amount: int = 1) -> None:
+        self.advances.append(amount)
+
+
 def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path) -> None:
     _root, run_module, report_module = _load_modules()
     default_params = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
@@ -145,6 +157,80 @@ def test_p8_end_to_end_parallel_workers_match_serial_outputs(tmp_path: Path) -> 
         output_path=tmp_path / "hf_parallel_rerendered.md",
     )
     assert _normalized_summary(serial_rerendered) == _normalized_summary(parallel_rerendered)
+
+
+def test_p8_lhs_progress_advances_per_sample_in_serial_mode() -> None:
+    _root, run_module, _report_module = _load_modules()
+    progress_tracker = _RecordingProgressTracker()
+    scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    uq = run_module.HighFidelityUQ()
+
+    result = run_module.run_lhs_uq(
+        scenarios=scenarios,
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=uq,
+        lhs_samples=3,
+        seed=77,
+        diagnostics_stride=1,
+        workers=1,
+        progress_tracker=progress_tracker,
+    )
+
+    assert progress_tracker.phases == ["lhs"]
+    assert progress_tracker.advances == [1, 1, 1]
+    assert len(result["scenario_envelopes"]) == len(scenarios)
+
+
+def test_p8_baseline_parallel_progress_updates_before_all_results_are_sorted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _root, run_module, _report_module = _load_modules()
+    scenarios = run_module.default_scenarios(duration_scale=0.05)[:3]
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    progress_tracker = _RecordingProgressTracker()
+    completion_order: list[str] = []
+
+    def fake_iter_process_pool_map(worker_fn, tasks, workers):
+        del worker_fn, workers
+        reversed_tasks = list(reversed(tasks))
+        for task in reversed_tasks:
+            scenario_name = task["scenario"].name
+            completion_order.append(scenario_name)
+            yield (
+                scenario_name,
+                {
+                    "trace": {"time_s": [0.0], "mean_core_temp_c": [0.0], "mean_surface_temp_c": [0.0], "load_error_pct": [0.0], "max_energy_residual_pct": [0.0], "coupling_converged_fraction": [1.0]},
+                    "summary": {
+                        "end_mean_core_temp_c": float(len(completion_order)),
+                        "peak_mean_core_temp_c": float(len(completion_order)),
+                        "end_mean_surface_temp_c": float(len(completion_order)),
+                        "peak_mean_surface_temp_c": float(len(completion_order)),
+                        "max_load_error_pct": 0.0,
+                        "max_energy_residual_pct": 0.0,
+                        "coupling_convergence_rate": 1.0,
+                        "all_outputs_finite": True,
+                    },
+                },
+            )
+            assert len(progress_tracker.advances) == len(completion_order)
+
+    monkeypatch.setattr(run_module, "_iter_process_pool_map", fake_iter_process_pool_map)
+
+    result = run_module.run_scenario_pack(
+        scenarios=scenarios,
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        diagnostics_stride=1,
+        workers=2,
+        progress_tracker=progress_tracker,
+    )
+
+    assert progress_tracker.phases == ["baseline"]
+    assert progress_tracker.advances == [1, 1, 1]
+    assert completion_order == [scenario.name for scenario in reversed(scenarios)]
+    assert list(result["scenario_summaries"]) == [scenario.name for scenario in scenarios]
 
 
 @pytest.mark.slow

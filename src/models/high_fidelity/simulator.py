@@ -10,6 +10,12 @@ import numpy as np
 from ..physics import celsius_to_kelvin
 from .boundary_conditions import BoundaryConditionModel, BoundaryState
 from .materials import ViscoelasticMaterialModel
+from .native_simulator_kernels import (
+    native_simulator_kernels_available,
+    native_simulator_kernels_enabled,
+    run_native_step_flash_field,
+    run_native_step_sidewall_field,
+)
 from .thermal_solver import ThermalFieldSolver2D
 from .types import (
     HighFidelityTireDiagnostics,
@@ -1076,14 +1082,36 @@ class HighFidelityTireSimulator:
         if not params.enabled:
             return np.repeat(bulk_surface_tw[None, :], self.parameters.theta_cells, axis=0)
 
-        next_field = np.array(flash_field_tw_k, dtype=float, copy=True)
         surface_cell_areas = self._thermal_solver.surface_cell_areas_m2
         _, theta_indices, width_indices = self._thermal_solver.contact_patch_indices(
             wheel_angular_speed_radps=wheel_angular_speed_radps,
             time_s=time_s,
         )
-        patch_area_by_zone = np.sum(surface_cell_areas[np.ix_(theta_indices, width_indices)], axis=0)
         flash_fraction = float(np.clip(params.friction_fraction, 0.0, 0.95))
+
+        if native_simulator_kernels_enabled() and native_simulator_kernels_available():
+            return run_native_step_flash_field(
+                flash_field_tw_k=flash_field_tw_k,
+                surface_cell_areas_tw=surface_cell_areas,
+                bulk_surface_w_k=bulk_surface_tw,
+                road_surface_temp_w_k=road_state.road_surface_temp_w_k,
+                zone_weights=zone_weights,
+                theta_indices=np.asarray(theta_indices, dtype=int),
+                width_indices=np.asarray(width_indices, dtype=int),
+                ambient_temp_k=ambient_temp_k,
+                friction_to_tire_w=friction_to_tire_w,
+                friction_fraction=flash_fraction,
+                bulk_coupling_time_s=float(params.bulk_coupling_time_s),
+                ambient_cooling_time_s=float(params.ambient_cooling_time_s),
+                patch_relaxation_time_s=float(params.patch_relaxation_time_s),
+                road_cooling_time_s=float(params.road_cooling_time_s),
+                areal_heat_capacity_j_per_m2k=float(params.areal_heat_capacity_j_per_m2k),
+                max_delta_above_bulk_k=float(params.max_delta_above_bulk_k),
+                dt_s=dt_s,
+            )
+
+        next_field = np.array(flash_field_tw_k, dtype=float, copy=True)
+        patch_area_by_zone = np.sum(surface_cell_areas[np.ix_(theta_indices, width_indices)], axis=0)
         patch_theta_set = set(int(idx) for idx in np.asarray(theta_indices, dtype=int))
 
         for zone_idx, width_idx in enumerate(width_indices):
@@ -1131,9 +1159,25 @@ class HighFidelityTireSimulator:
         brake_heat_to_sidewall_w: float,
         dt_s: float,
     ) -> tuple[np.ndarray, float]:
-        next_field = np.array(sidewall_field_tw_k, dtype=float, copy=True)
         shoulder_temp_by_zone = np.mean(thermal_field_rtw_k[int(round(0.45 * (thermal_field_rtw_k.shape[0] - 1))), :, :], axis=0)
         gas_temp_k = float(np.mean(thermal_field_rtw_k[0, :, :]))
+
+        if native_simulator_kernels_enabled() and native_simulator_kernels_available():
+            return run_native_step_sidewall_field(
+                sidewall_field_tw_k=sidewall_field_tw_k,
+                shoulder_temp_by_zone_k=shoulder_temp_by_zone,
+                gas_temp_k=gas_temp_k,
+                ambient_temp_k=float(inputs.ambient_temp_k),
+                rim_temp_k=rim_temp_k,
+                solar_w_m2=float(inputs.solar_w_m2),
+                wind_mps=float(inputs.wind_mps),
+                wind_yaw_rad=float(inputs.wind_yaw_rad),
+                wheel_wake_factor=float(inputs.wheel_wake_factor),
+                brake_heat_to_sidewall_w=brake_heat_to_sidewall_w,
+                dt_s=dt_s,
+            )
+
+        next_field = np.array(sidewall_field_tw_k, dtype=float, copy=True)
         total_heat_w = 0.0
         per_zone_brake = brake_heat_to_sidewall_w / max(self.parameters.width_zones, 1)
         capacity = 1.65e5
