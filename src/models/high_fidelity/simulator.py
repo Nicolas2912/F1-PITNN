@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import math
 import time
 from typing import Iterable
@@ -26,6 +26,14 @@ from .types import (
 from .wheel_coupling import WheelCouplingResult, WheelForceCouplingModel
 
 
+@dataclass(frozen=True)
+class _BoundarySourceGeometryCache:
+    bulk_radial_indices: np.ndarray
+    theta_indices_by_center: np.ndarray
+    patch_density_scale_m3_inv: np.ndarray
+    inner_ring_volume_m3: float
+
+
 class HighFidelityTireSimulator:
     """Layered high-fidelity tire simulator with width-aware thermal transport."""
 
@@ -35,6 +43,46 @@ class HighFidelityTireSimulator:
         self._thermal_solver = ThermalFieldSolver2D(self.parameters)
         self._boundary_model = BoundaryConditionModel(self.parameters.boundary)
         self._wheel_coupling = WheelForceCouplingModel(self.parameters)
+        self._boundary_source_geometry_cache = self._build_boundary_source_geometry_cache()
+
+    def _build_boundary_source_geometry_cache(self) -> _BoundarySourceGeometryCache:
+        solver = self._thermal_solver
+        radial_cells = self.parameters.radial_cells
+        theta_cells = self.parameters.theta_cells
+        deep_start = max(int(round(0.48 * (radial_cells - 1))), 0)
+        bulk_radial_indices = np.arange(deep_start, radial_cells, dtype=int)
+        radial_positions = np.linspace(0.0, 1.0, bulk_radial_indices.shape[0], dtype=float)
+        radial_weights = 0.15 + 0.85 * radial_positions**1.4
+        radial_weights /= max(float(np.sum(radial_weights)), 1e-12)
+        theta_indices_by_center = (
+            np.arange(theta_cells, dtype=int)[:, None] + solver._theta_offsets[None, :]
+        ) % theta_cells
+        width_indices = solver._width_indices
+        cell_volumes = solver._cell_volumes_m3
+        patch_density_scale_m3_inv = np.empty(
+            (theta_cells, bulk_radial_indices.shape[0], width_indices.shape[0]),
+            dtype=float,
+        )
+        for center_idx, theta_indices in enumerate(theta_indices_by_center):
+            patch_volumes = np.sum(
+                cell_volumes[
+                    bulk_radial_indices[:, None, None],
+                    theta_indices[None, :, None],
+                    width_indices[None, None, :],
+                ],
+                axis=1,
+            )
+            patch_density_scale_m3_inv[center_idx] = radial_weights[:, None] / np.maximum(
+                patch_volumes,
+                1e-12,
+            )
+        inner_ring_volume_m3 = float(np.sum(cell_volumes[0, :, :]))
+        return _BoundarySourceGeometryCache(
+            bulk_radial_indices=bulk_radial_indices,
+            theta_indices_by_center=theta_indices_by_center,
+            patch_density_scale_m3_inv=patch_density_scale_m3_inv,
+            inner_ring_volume_m3=inner_ring_volume_m3,
+        )
 
     def initial_state(
         self,
@@ -981,30 +1029,24 @@ class HighFidelityTireSimulator:
         wheel_angular_speed_radps: float,
         time_s: float,
     ) -> np.ndarray:
-        source = np.zeros_like(thermal_field_rtw_k)
+        source = np.empty_like(thermal_field_rtw_k)
+        source.fill(0.0)
         flash_fraction = 0.0
         if self.parameters.flash_layer.enabled:
             flash_fraction = float(np.clip(self.parameters.flash_layer.friction_fraction, 0.0, 0.95))
         bulk_fraction = 1.0 - flash_fraction
-        cell_volumes = self._thermal_solver.cell_volumes_m3
-        radial_indices, theta_indices, width_indices = self._thermal_solver.contact_patch_indices(
-            wheel_angular_speed_radps=wheel_angular_speed_radps,
-            time_s=time_s,
-        )
-        radial_cells = thermal_field_rtw_k.shape[0]
-        deep_start = max(int(round(0.48 * (radial_cells - 1))), 0)
-        bulk_radial_indices = np.arange(deep_start, radial_cells, dtype=int)
-        radial_positions = np.linspace(0.0, 1.0, bulk_radial_indices.shape[0], dtype=float)
-        radial_weights = 0.15 + 0.85 * radial_positions**1.4
-        radial_weights /= max(float(np.sum(radial_weights)), 1e-12)
-        for zone_idx, width_idx in enumerate(width_indices):
+        solver = self._thermal_solver
+        cache = self._boundary_source_geometry_cache
+        phase_theta = (wheel_angular_speed_radps * time_s) % (2.0 * math.pi)
+        center_theta_idx = int(round(phase_theta / max(solver._theta_delta_rad, 1e-9))) % self.parameters.theta_cells
+        theta_indices = cache.theta_indices_by_center[center_theta_idx]
+        patch_density_scale_m3_inv = cache.patch_density_scale_m3_inv[center_theta_idx]
+        for zone_idx, width_idx in enumerate(solver._width_indices):
             patch_power_w = bulk_fraction * zone_friction_to_tire_w[zone_idx] - road_conduction_w_by_zone[zone_idx]
-            for local_idx, radial_idx in enumerate(bulk_radial_indices):
-                patch_index = np.ix_(np.array([radial_idx], dtype=int), theta_indices, np.array([width_idx], dtype=int))
-                patch_volume = float(np.sum(cell_volumes[patch_index]))
-                source[patch_index] += patch_power_w * radial_weights[local_idx] / max(patch_volume, 1e-12)
-        inner_ring_volume = float(np.sum(cell_volumes[0, :, :]))
-        source[0, :, :] += (brake_heat_to_tire_w - rim_conduction_w) / max(inner_ring_volume, 1e-12)
+            density_by_radial = patch_power_w * patch_density_scale_m3_inv[:, zone_idx]
+            width_plane = source[:, :, width_idx]
+            width_plane[cache.bulk_radial_indices[:, None], theta_indices[None, :]] += density_by_radial[:, None]
+        source[0, :, :] += (brake_heat_to_tire_w - rim_conduction_w) / max(cache.inner_ring_volume_m3, 1e-12)
         return source
 
     def _zone_array(self, values: np.ndarray | tuple[float, float, float] | None, width_zones: int) -> np.ndarray:

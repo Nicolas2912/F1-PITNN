@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 
@@ -142,6 +143,46 @@ def _legacy_solver_step(
     return out
 
 
+def _legacy_boundary_source_field_w_per_m3(
+    simulator: HighFidelityTireSimulator,
+    *,
+    thermal_field_rtw_k: np.ndarray,
+    zone_friction_to_tire_w: np.ndarray,
+    road_conduction_w_by_zone: np.ndarray,
+    rim_conduction_w: float,
+    brake_heat_to_tire_w: float,
+    zone_weights: np.ndarray,
+    wheel_angular_speed_radps: float,
+    time_s: float,
+) -> np.ndarray:
+    del zone_weights
+    source = np.zeros_like(thermal_field_rtw_k)
+    flash_fraction = 0.0
+    if simulator.parameters.flash_layer.enabled:
+        flash_fraction = float(np.clip(simulator.parameters.flash_layer.friction_fraction, 0.0, 0.95))
+    bulk_fraction = 1.0 - flash_fraction
+    cell_volumes = simulator._thermal_solver.cell_volumes_m3
+    _, theta_indices, width_indices = simulator._thermal_solver.contact_patch_indices(
+        wheel_angular_speed_radps=wheel_angular_speed_radps,
+        time_s=time_s,
+    )
+    radial_cells = thermal_field_rtw_k.shape[0]
+    deep_start = max(int(round(0.48 * (radial_cells - 1))), 0)
+    bulk_radial_indices = np.arange(deep_start, radial_cells, dtype=int)
+    radial_positions = np.linspace(0.0, 1.0, bulk_radial_indices.shape[0], dtype=float)
+    radial_weights = 0.15 + 0.85 * radial_positions**1.4
+    radial_weights /= max(float(np.sum(radial_weights)), 1e-12)
+    for zone_idx, width_idx in enumerate(width_indices):
+        patch_power_w = bulk_fraction * zone_friction_to_tire_w[zone_idx] - road_conduction_w_by_zone[zone_idx]
+        for local_idx, radial_idx in enumerate(bulk_radial_indices):
+            patch_index = np.ix_(np.array([radial_idx], dtype=int), theta_indices, np.array([width_idx], dtype=int))
+            patch_volume = float(np.sum(cell_volumes[patch_index]))
+            source[patch_index] += patch_power_w * radial_weights[local_idx] / max(patch_volume, 1e-12)
+    inner_ring_volume = float(np.sum(cell_volumes[0, :, :]))
+    source[0, :, :] += (brake_heat_to_tire_w - rim_conduction_w) / max(inner_ring_volume, 1e-12)
+    return source
+
+
 def test_p3_radial_grid_is_nonuniform_and_biased_toward_outer_radius() -> None:
     params = HighFidelityTireModelParameters(
         radial_cells=16,
@@ -177,6 +218,104 @@ def test_p3_solver_source_window_moves_with_rotation_phase() -> None:
 
     assert not np.array_equal(source_0, source_later)
     assert np.any(np.abs(source_0[-1, :] - source_later[-1, :]) > 1e-12)
+
+
+def test_p3_boundary_source_matches_legacy_distribution() -> None:
+    params = HighFidelityTireModelParameters(
+        use_2d_thermal_solver=True,
+        no_op_thermal_step=False,
+        radial_cells=36,
+        theta_cells=72,
+        width_zones=3,
+    )
+    simulator = HighFidelityTireSimulator(params)
+    thermal_field = simulator._thermal_solver.initial_temperature_field(celsius_to_kelvin(37.0))
+    zone_friction_to_tire_w = np.array([1800.0, 2250.0, 1675.0], dtype=float)
+    road_conduction_w_by_zone = np.array([240.0, 275.0, 210.0], dtype=float)
+    zone_weights = np.array([0.25, 0.45, 0.30], dtype=float)
+
+    for time_s in np.linspace(0.0, 0.19, 9, dtype=float):
+        legacy = _legacy_boundary_source_field_w_per_m3(
+            simulator,
+            thermal_field_rtw_k=thermal_field,
+            zone_friction_to_tire_w=zone_friction_to_tire_w,
+            road_conduction_w_by_zone=road_conduction_w_by_zone,
+            rim_conduction_w=380.0,
+            brake_heat_to_tire_w=1250.0,
+            zone_weights=zone_weights,
+            wheel_angular_speed_radps=185.0,
+            time_s=float(time_s),
+        )
+        optimized = simulator._boundary_source_field_w_per_m3(
+            thermal_field_rtw_k=thermal_field,
+            zone_friction_to_tire_w=zone_friction_to_tire_w,
+            road_conduction_w_by_zone=road_conduction_w_by_zone,
+            rim_conduction_w=380.0,
+            brake_heat_to_tire_w=1250.0,
+            zone_weights=zone_weights,
+            wheel_angular_speed_radps=185.0,
+            time_s=float(time_s),
+        )
+
+        assert np.allclose(optimized, legacy, rtol=0.0, atol=1e-7)
+
+
+def test_p3_boundary_source_fast_path_is_not_slower_than_legacy() -> None:
+    params = HighFidelityTireModelParameters(
+        use_2d_thermal_solver=True,
+        no_op_thermal_step=False,
+        radial_cells=36,
+        theta_cells=72,
+        width_zones=3,
+    )
+    simulator = HighFidelityTireSimulator(params)
+    thermal_field = simulator._thermal_solver.initial_temperature_field(celsius_to_kelvin(37.0))
+    zone_friction_to_tire_w = np.array([1800.0, 2250.0, 1675.0], dtype=float)
+    road_conduction_w_by_zone = np.array([240.0, 275.0, 210.0], dtype=float)
+    zone_weights = np.array([0.25, 0.45, 0.30], dtype=float)
+    time_samples = np.linspace(0.0, 0.45, 120, dtype=float)
+
+    start = time.perf_counter()
+    legacy_checksum = 0.0
+    for time_s in time_samples:
+        legacy_checksum += float(
+            np.sum(
+                _legacy_boundary_source_field_w_per_m3(
+                    simulator,
+                    thermal_field_rtw_k=thermal_field,
+                    zone_friction_to_tire_w=zone_friction_to_tire_w,
+                    road_conduction_w_by_zone=road_conduction_w_by_zone,
+                    rim_conduction_w=380.0,
+                    brake_heat_to_tire_w=1250.0,
+                    zone_weights=zone_weights,
+                    wheel_angular_speed_radps=185.0,
+                    time_s=float(time_s),
+                )
+            )
+        )
+    legacy_elapsed_s = time.perf_counter() - start
+
+    start = time.perf_counter()
+    optimized_checksum = 0.0
+    for time_s in time_samples:
+        optimized_checksum += float(
+            np.sum(
+                simulator._boundary_source_field_w_per_m3(
+                    thermal_field_rtw_k=thermal_field,
+                    zone_friction_to_tire_w=zone_friction_to_tire_w,
+                    road_conduction_w_by_zone=road_conduction_w_by_zone,
+                    rim_conduction_w=380.0,
+                    brake_heat_to_tire_w=1250.0,
+                    zone_weights=zone_weights,
+                    wheel_angular_speed_radps=185.0,
+                    time_s=float(time_s),
+                )
+            )
+        )
+    optimized_elapsed_s = time.perf_counter() - start
+
+    assert math.isclose(optimized_checksum, legacy_checksum, rel_tol=0.0, abs_tol=1e-6)
+    assert optimized_elapsed_s <= legacy_elapsed_s * 0.99
 
 
 def test_p3_solver_energy_residual_is_small_in_nominal_step() -> None:
