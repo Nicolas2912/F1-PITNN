@@ -592,40 +592,137 @@ class ThermalFieldSolver2D:
         estimate = self._scratch_estimate
         np.copyto(estimate, rhs)
         iterations = 0
-        radial_prev = self._scratch_radial_prev
-        radial_next = self._scratch_radial_next
-        width_prev = self._scratch_width_prev
-        width_next = self._scratch_width_next
-        theta_prev = self._scratch_theta_prev
-        theta_next = self._scratch_theta_next
         updated = self._scratch_updated
+        theta_work = self._scratch_theta_prev
+        radial_cells, theta_cells, width_zones = estimate.shape
         for iterations in range(1, max(self.parameters.diffusion_max_iterations, 1) + 1):
-            radial_prev.fill(0.0)
-            radial_next.fill(0.0)
-            radial_prev[1:, :, :] = estimate[:-1, :, :]
-            radial_next[:-1, :, :] = estimate[1:, :, :]
-            width_prev.fill(0.0)
-            width_next.fill(0.0)
-            width_prev[:, :, 1:] = estimate[:, :, :-1]
-            width_next[:, :, :-1] = estimate[:, :, 1:]
-            theta_prev[:, 0, :] = estimate[:, -1, :]
-            theta_prev[:, 1:, :] = estimate[:, :-1, :]
-            theta_next[:, -1, :] = estimate[:, 0, :]
-            theta_next[:, :-1, :] = estimate[:, 1:, :]
+            previous = np.array(estimate, copy=True)
 
-            np.copyto(updated, rhs)
-            updated += coeff_r_minus * radial_prev
-            updated += coeff_r_plus * radial_next
-            updated += coeff_theta * theta_prev
-            updated += coeff_theta * theta_next
-            updated += coeff_w_minus * width_prev
-            updated += coeff_w_plus * width_next
-            updated /= np.maximum(diagonal, 1e-12)
-            max_delta = float(np.max(np.abs(updated - estimate)))
+            for theta_idx in range(theta_cells):
+                theta_prev_idx = (theta_idx - 1) % theta_cells
+                theta_next_idx = (theta_idx + 1) % theta_cells
+                for width_idx in range(width_zones):
+                    line_rhs = (
+                        rhs[:, theta_idx, width_idx]
+                        + coeff_theta[:, theta_idx, width_idx]
+                        * (previous[:, theta_prev_idx, width_idx] + previous[:, theta_next_idx, width_idx])
+                    )
+                    if width_idx > 0:
+                        line_rhs = line_rhs + coeff_w_minus[:, theta_idx, width_idx] * previous[:, theta_idx, width_idx - 1]
+                    if width_idx + 1 < width_zones:
+                        line_rhs = line_rhs + coeff_w_plus[:, theta_idx, width_idx] * previous[:, theta_idx, width_idx + 1]
+                    updated[:, theta_idx, width_idx] = self._solve_tridiagonal_line_python(
+                        lower=-coeff_r_minus[1:, theta_idx, width_idx],
+                        diagonal=diagonal[:, theta_idx, width_idx] - 2.0 * coeff_theta[:, theta_idx, width_idx] - coeff_w_minus[:, theta_idx, width_idx] - coeff_w_plus[:, theta_idx, width_idx],
+                        upper=-coeff_r_plus[:-1, theta_idx, width_idx],
+                        rhs=line_rhs,
+                    )
+
+            for radial_idx in range(radial_cells):
+                for width_idx in range(width_zones):
+                    line_rhs = rhs[radial_idx, :, width_idx]
+                    if radial_idx > 0:
+                        line_rhs = line_rhs + coeff_r_minus[radial_idx, :, width_idx] * updated[radial_idx - 1, :, width_idx]
+                    if radial_idx + 1 < radial_cells:
+                        line_rhs = line_rhs + coeff_r_plus[radial_idx, :, width_idx] * updated[radial_idx + 1, :, width_idx]
+                    if width_idx > 0:
+                        line_rhs = line_rhs + coeff_w_minus[radial_idx, :, width_idx] * updated[radial_idx, :, width_idx - 1]
+                    if width_idx + 1 < width_zones:
+                        line_rhs = line_rhs + coeff_w_plus[radial_idx, :, width_idx] * updated[radial_idx, :, width_idx + 1]
+                    theta_work[radial_idx, :, width_idx] = self._solve_cyclic_tridiagonal_line_python(
+                        lower=-coeff_theta[radial_idx, 1:, width_idx],
+                        diagonal=diagonal[radial_idx, :, width_idx] - coeff_r_minus[radial_idx, :, width_idx] - coeff_r_plus[radial_idx, :, width_idx] - coeff_w_minus[radial_idx, :, width_idx] - coeff_w_plus[radial_idx, :, width_idx],
+                        upper=-coeff_theta[radial_idx, :-1, width_idx],
+                        alpha=-coeff_theta[radial_idx, 0, width_idx],
+                        beta=-coeff_theta[radial_idx, -1, width_idx],
+                        rhs=line_rhs,
+                    )
+
+            for radial_idx in range(radial_cells):
+                theta_prev = np.roll(theta_work[radial_idx, :, :], shift=1, axis=0)
+                theta_next = np.roll(theta_work[radial_idx, :, :], shift=-1, axis=0)
+                for theta_idx in range(theta_cells):
+                    line_rhs = (
+                        rhs[radial_idx, theta_idx, :]
+                        + coeff_theta[radial_idx, theta_idx, :] * (theta_prev[theta_idx, :] + theta_next[theta_idx, :])
+                    )
+                    if radial_idx > 0:
+                        line_rhs = line_rhs + coeff_r_minus[radial_idx, theta_idx, :] * theta_work[radial_idx - 1, theta_idx, :]
+                    if radial_idx + 1 < radial_cells:
+                        line_rhs = line_rhs + coeff_r_plus[radial_idx, theta_idx, :] * theta_work[radial_idx + 1, theta_idx, :]
+                    updated[radial_idx, theta_idx, :] = self._solve_tridiagonal_line_python(
+                        lower=-coeff_w_minus[radial_idx, theta_idx, 1:],
+                        diagonal=diagonal[radial_idx, theta_idx, :] - coeff_r_minus[radial_idx, theta_idx, :] - coeff_r_plus[radial_idx, theta_idx, :] - 2.0 * coeff_theta[radial_idx, theta_idx, :],
+                        upper=-coeff_w_plus[radial_idx, theta_idx, :-1],
+                        rhs=line_rhs,
+                    )
+
+            max_delta = float(np.max(np.abs(updated - previous)))
             estimate, updated = updated, estimate
             if max_delta < self.parameters.diffusion_tolerance_k:
                 break
         return np.array(estimate, copy=True), iterations
+
+    def _solve_tridiagonal_line_python(
+        self,
+        *,
+        lower: np.ndarray,
+        diagonal: np.ndarray,
+        upper: np.ndarray,
+        rhs: np.ndarray,
+    ) -> np.ndarray:
+        diag = np.array(diagonal, dtype=float, copy=True)
+        out = np.array(rhs, dtype=float, copy=True)
+        size = diag.shape[0]
+        if size == 1:
+            out[0] /= max(diag[0], 1e-12)
+            return out
+        lower_work = np.array(lower, dtype=float, copy=True)
+        upper_work = np.array(upper, dtype=float, copy=True)
+        for idx in range(1, size):
+            pivot = max(diag[idx - 1], 1e-12)
+            factor = lower_work[idx - 1] / pivot
+            diag[idx] -= factor * upper_work[idx - 1]
+            out[idx] -= factor * out[idx - 1]
+        out[-1] /= max(diag[-1], 1e-12)
+        for idx in range(size - 2, -1, -1):
+            out[idx] = (out[idx] - upper_work[idx] * out[idx + 1]) / max(diag[idx], 1e-12)
+        return out
+
+    def _solve_cyclic_tridiagonal_line_python(
+        self,
+        *,
+        lower: np.ndarray,
+        diagonal: np.ndarray,
+        upper: np.ndarray,
+        alpha: float,
+        beta: float,
+        rhs: np.ndarray,
+    ) -> np.ndarray:
+        size = diagonal.shape[0]
+        if size == 1:
+            return np.asarray(rhs, dtype=float) / max(diagonal[0] + alpha + beta, 1e-12)
+        gamma = -float(diagonal[0]) if diagonal[0] != 0.0 else -1.0
+        modified_diag = np.array(diagonal, dtype=float, copy=True)
+        modified_diag[0] -= gamma
+        modified_diag[-1] -= (alpha * beta) / gamma
+        solution = self._solve_tridiagonal_line_python(
+            lower=lower,
+            diagonal=modified_diag,
+            upper=upper,
+            rhs=rhs,
+        )
+        helper_rhs = np.zeros(size, dtype=float)
+        helper_rhs[0] = gamma
+        helper_rhs[-1] = alpha
+        helper = self._solve_tridiagonal_line_python(
+            lower=lower,
+            diagonal=modified_diag,
+            upper=upper,
+            rhs=helper_rhs,
+        )
+        factor = (solution[0] + beta * solution[-1] / gamma) / max(1.0 + helper[0] + beta * helper[-1] / gamma, 1e-12)
+        return solution - factor * helper
 
     def _total_energy_j(self, field: np.ndarray, *, rho_cp: np.ndarray) -> float:
         return float(np.sum(field * rho_cp * self._cell_volumes_m3))
