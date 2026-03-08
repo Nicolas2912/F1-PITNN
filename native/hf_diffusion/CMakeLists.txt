@@ -20,7 +20,7 @@ endif()
 
 Python_add_library(_hf_diffusion_native MODULE diffusion.cpp WITH_SOABI)
 target_compile_features(_hf_diffusion_native PRIVATE cxx_std_17)
-target_compile_options(_hf_diffusion_native PRIVATE -O3)
+target_compile_options(_hf_diffusion_native PRIVATE -O3 -ffp-contract=off)
 target_include_directories(_hf_diffusion_native PRIVATE "${PYBIND11_INCLUDE_DIR}")
 if(APPLE)
   target_link_libraries(_hf_diffusion_native PRIVATE "${ACCELERATE_FRAMEWORK}")

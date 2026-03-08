@@ -196,6 +196,7 @@ def _normalize_artifact(payload: dict) -> dict:
     metadata = normalized.get("metadata", {})
     for key in ("created_at_utc", "results_path", "summary_path"):
         metadata.pop(key, None)
+    normalized.pop("timing", None)
     return normalized
 
 
@@ -206,6 +207,11 @@ def _normalize_summary(text: str) -> str:
         if not line.startswith("- created_at_utc:")
         and not line.startswith("- results_json:")
         and not line.startswith("- summary_md:")
+        and not line.startswith("- total_elapsed_s:")
+        and not line.startswith("| baseline |")
+        and not line.startswith("| lhs |")
+        and not line.startswith("| sobol |")
+        and not line.startswith("| done |")
     )
 
 

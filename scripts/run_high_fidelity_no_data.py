@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import json
 import multiprocessing as mp
 from pathlib import Path
+from queue import Empty
 import sys
+import threading
+import time
 
 import numpy as np
 from tqdm import tqdm
@@ -25,6 +28,7 @@ from models.vehicle_thermal import VehicleInputs, VehicleParameters  # noqa: E40
 OUTPUT_DIR = ROOT / "reports" / "results"
 RESULTS_FILE = OUTPUT_DIR / "high_fidelity_no_data_results.json"
 SUMMARY_FILE = OUTPUT_DIR / "high_fidelity_no_data_summary.md"
+_WORKER_PROGRESS_QUEUE = None
 
 
 @dataclass(frozen=True)
@@ -66,18 +70,95 @@ class FidelityPreset:
 @dataclass
 class ProgressTracker:
     bar: tqdm | None = None
+    phase_totals: dict[str, int] = field(default_factory=dict)
+    _run_started_at: float = field(default_factory=time.perf_counter)
+    _phase_started_at: dict[str, float] = field(default_factory=dict)
+    _phase_elapsed_s: dict[str, float] = field(default_factory=dict)
+    _phase_completed: dict[str, int] = field(default_factory=dict)
+    _phase_order: list[str] = field(default_factory=list)
+    _active_phase: str | None = None
 
     def set_phase(self, label: str) -> None:
+        now = time.perf_counter()
+        if self._active_phase is not None:
+            self._phase_elapsed_s[self._active_phase] = (
+                self._phase_elapsed_s.get(self._active_phase, 0.0)
+                + max(now - self._phase_started_at.get(self._active_phase, now), 0.0)
+            )
+        self._active_phase = label
+        self._phase_started_at[label] = now
+        self._phase_completed.setdefault(label, 0)
+        if label not in self._phase_order:
+            self._phase_order.append(label)
         if self.bar is not None:
             self.bar.set_description(label)
+            self._refresh_bar(now)
+            self.bar.refresh()
 
     def advance(self, amount: int = 1) -> None:
-        if self.bar is not None and amount > 0:
+        if amount <= 0:
+            return
+        if self._active_phase is not None:
+            self._phase_completed[self._active_phase] = self._phase_completed.get(self._active_phase, 0) + amount
+        if self.bar is not None:
             self.bar.update(amount)
+            self._refresh_bar(time.perf_counter())
 
     def close(self) -> None:
+        if self._active_phase is not None:
+            now = time.perf_counter()
+            self._phase_elapsed_s[self._active_phase] = (
+                self._phase_elapsed_s.get(self._active_phase, 0.0)
+                + max(now - self._phase_started_at.get(self._active_phase, now), 0.0)
+            )
+            self._active_phase = None
         if self.bar is not None:
             self.bar.close()
+
+    def timings(self) -> dict[str, object]:
+        phases: dict[str, dict[str, float | int | None]] = {}
+        now = time.perf_counter()
+        for label in self._phase_order:
+            elapsed_s = self._phase_elapsed_s.get(label, 0.0)
+            if label == self._active_phase:
+                elapsed_s += max(now - self._phase_started_at.get(label, now), 0.0)
+            completed_units = int(self._phase_completed.get(label, 0))
+            total_units = int(self.phase_totals.get(label, completed_units))
+            avg_seconds_per_unit = elapsed_s / completed_units if completed_units > 0 else None
+            throughput_units_per_s = completed_units / elapsed_s if elapsed_s > 0.0 else None
+            phases[label] = {
+                "elapsed_s": float(elapsed_s),
+                "completed_units": completed_units,
+                "total_units": total_units,
+                "avg_seconds_per_unit": (
+                    float(avg_seconds_per_unit) if avg_seconds_per_unit is not None else None
+                ),
+                "throughput_units_per_s": (
+                    float(throughput_units_per_s) if throughput_units_per_s is not None else None
+                ),
+            }
+        return {
+            "total_elapsed_s": float(now - self._run_started_at),
+            "phases": phases,
+        }
+
+    def _refresh_bar(self, now: float) -> None:
+        if self.bar is None or self._active_phase is None:
+            return
+        phase = self._active_phase
+        completed = int(self._phase_completed.get(phase, 0))
+        total = int(self.phase_totals.get(phase, completed))
+        phase_elapsed_s = max(now - self._phase_started_at.get(phase, now), 0.0)
+        total_elapsed_s = max(now - self._run_started_at, 0.0)
+        eta_s = None
+        if completed > 0 and total > completed:
+            eta_s = phase_elapsed_s * (total - completed) / completed
+        eta_label = _format_seconds(eta_s)
+        self.bar.set_postfix_str(
+            f"{completed}/{total} phase_elapsed={_format_seconds(phase_elapsed_s)} "
+            f"phase_eta={eta_label} total_elapsed={_format_seconds(total_elapsed_s)}",
+            refresh=False,
+        )
 
 
 class ProcessPoolRunner:
@@ -100,6 +181,9 @@ class ProcessPoolRunner:
             self._pool.join()
             self._pool = None
 
+    def restart(self) -> None:
+        self.close()
+
     def terminate(self) -> None:
         if self._pool is not None:
             self._pool.terminate()
@@ -114,6 +198,38 @@ class ProcessPoolRunner:
             self.close()
         else:
             self.terminate()
+
+
+class _QueueProgressDrainer:
+    def __init__(self, queue, progress_tracker: ProgressTracker) -> None:
+        self._queue = queue
+        self._progress_tracker = progress_tracker
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="uq-progress-drainer", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join()
+        self.drain()
+
+    def drain(self) -> None:
+        while True:
+            try:
+                amount = self._queue.get_nowait()
+            except Empty:
+                break
+            self._progress_tracker.advance(int(amount))
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                amount = self._queue.get(timeout=0.1)
+            except Empty:
+                continue
+            self._progress_tracker.advance(int(amount))
 
 
 PRESETS: dict[str, FidelityPreset] = {
@@ -145,6 +261,18 @@ PRESETS: dict[str, FidelityPreset] = {
         diagnostics_stride=1,
     ),
 }
+
+
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    if value < 60.0:
+        return f"{value:.1f}s"
+    minutes, seconds = divmod(value, 60.0)
+    if minutes < 60.0:
+        return f"{int(minutes)}m{seconds:04.1f}s"
+    hours, minutes = divmod(minutes, 60.0)
+    return f"{int(hours)}h{int(minutes):02d}m{seconds:04.1f}s"
 
 
 def fidelity_preset(name: str) -> FidelityPreset:
@@ -368,6 +496,26 @@ def _iter_parallel_map(
     yield from _iter_process_pool_map(worker_fn, tasks, workers)
 
 
+def _parallel_progress_context(
+    *,
+    progress_tracker: ProgressTracker | None,
+    pool_runner: ProcessPoolRunner | None,
+):
+    if progress_tracker is None:
+        return None, None
+    if pool_runner is not None and getattr(pool_runner, "_context", None) is not None:
+        context = pool_runner._context
+    else:
+        start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+        context = mp.get_context(start_method)
+    if context.get_start_method() != "fork":
+        return None, None
+    queue = context.Queue()
+    drainer = _QueueProgressDrainer(queue=queue, progress_tracker=progress_tracker)
+    drainer.start()
+    return queue, drainer
+
+
 def _run_scenario_task(task: dict) -> tuple[str, dict]:
     scenario: ScenarioConfig = task["scenario"]
     result = run_single_scenario(
@@ -418,7 +566,7 @@ def _evaluate_lhs_batch(task: dict) -> list[tuple[int, dict[str, tuple[list[floa
         }
         scenario_results: dict[str, tuple[list[float], list[float]]] = {}
         for scenario in scenarios:
-            result = run_single_scenario(
+            result = run_single_scenario_temperature_trace(
                 scenario=scenario,
                 tire_parameters=sampled_tire_parameters,
                 vehicle_parameters=task["vehicle_parameters"],
@@ -429,9 +577,11 @@ def _evaluate_lhs_batch(task: dict) -> list[tuple[int, dict[str, tuple[list[floa
                 prepared_inputs=prepared_inputs[scenario.name],
             )
             scenario_results[scenario.name] = (
-                result["trace"]["mean_core_temp_c"],
-                result["trace"]["mean_surface_temp_c"],
+                result["mean_core_temp_c"],
+                result["mean_surface_temp_c"],
             )
+            if _WORKER_PROGRESS_QUEUE is not None:
+                _WORKER_PROGRESS_QUEUE.put(1)
         outputs.append((sample_idx, scenario_results))
     return outputs
 
@@ -447,7 +597,7 @@ def _evaluate_sobol_batch(task: dict) -> list[tuple[int, float]]:
             tire_parameters=sampled_tire_parameters,
             vehicle_parameters=task["vehicle_parameters"],
         )
-        result = run_single_scenario(
+        result = run_single_scenario_temperature_trace(
             scenario=scenario,
             tire_parameters=sampled_tire_parameters,
             vehicle_parameters=task["vehicle_parameters"],
@@ -457,7 +607,9 @@ def _evaluate_sobol_batch(task: dict) -> list[tuple[int, float]]:
             inputs=scenario_inputs,
             prepared_inputs=simulator.prepare_inputs(scenario_inputs),
         )
-        outputs.append((eval_idx, float(result["summary"]["peak_mean_surface_temp_c"])))
+        outputs.append((eval_idx, float(result["peak_mean_surface_temp_c"])))
+        if _WORKER_PROGRESS_QUEUE is not None:
+            _WORKER_PROGRESS_QUEUE.put(1)
     return outputs
 
 
@@ -466,14 +618,15 @@ def _batched_uq_tasks(
     items: list[tuple[int, dict[str, float]]],
     workers: int,
     base_task: dict,
+    batch_size: int | None = None,
 ) -> list[dict]:
-    batch_size = _batch_size(len(items), workers)
+    resolved_batch_size = _batch_size(len(items), workers) if batch_size is None else max(int(batch_size), 1)
     return [
         {
             **base_task,
             "batch": [(item_idx, dict(sample)) for item_idx, sample in batch],
         }
-        for batch in _batched(items, batch_size)
+        for batch in _batched(items, resolved_batch_size)
     ]
 
 
@@ -486,13 +639,20 @@ def _should_enable_progress(enabled: bool | None) -> bool:
 def _build_progress_tracker(
     *,
     scenarios: tuple[ScenarioConfig, ...],
+    uq_scenario_count: int,
     lhs_samples: int,
     sobol_eval_count: int,
     enabled: bool | None,
 ) -> ProgressTracker:
+    phase_totals = {
+        "baseline": len(scenarios),
+        "lhs": int(lhs_samples) * max(int(uq_scenario_count), 1),
+        "sobol": int(sobol_eval_count),
+        "done": 0,
+    }
     if not _should_enable_progress(enabled):
-        return ProgressTracker()
-    total = len(scenarios) + lhs_samples + sobol_eval_count
+        return ProgressTracker(phase_totals=phase_totals)
+    total = len(scenarios) + phase_totals["lhs"] + sobol_eval_count
     bar = tqdm(
         total=total,
         desc="baseline",
@@ -501,7 +661,7 @@ def _build_progress_tracker(
         leave=True,
         file=sys.stderr,
     )
-    return ProgressTracker(bar=bar)
+    return ProgressTracker(bar=bar, phase_totals=phase_totals)
 
 
 def run_high_fidelity_no_data(
@@ -536,6 +696,7 @@ def run_high_fidelity_no_data(
     scenarios = default_scenarios(duration_scale=duration_scale)
     progress_tracker = _build_progress_tracker(
         scenarios=scenarios,
+        uq_scenario_count=sum(1 for scenario in scenarios if scenario.include_in_uq),
         lhs_samples=lhs_samples,
         sobol_eval_count=sobol_samples * (2 + len(HighFidelityUQ().default_tire_priors(parameters=tire_params))),
         enabled=progress,
@@ -585,6 +746,8 @@ def run_high_fidelity_no_data(
         if pool_runner is not None:
             pool_runner.close()
 
+    progress_tracker.set_phase("done")
+    timing_summary = progress_tracker.timings()
     artifact = {
         "metadata": {
             "created_at_utc": datetime.now(UTC).isoformat(),
@@ -604,6 +767,7 @@ def run_high_fidelity_no_data(
             "scenario_names": [scenario.name for scenario in scenarios],
             "uq_scenario_names": [scenario.name for scenario in scenarios if scenario.include_in_uq],
         },
+        "timing": timing_summary,
         "priors": [asdict(prior) for prior in priors],
         "baseline": baseline,
         "uq": {
@@ -616,7 +780,6 @@ def run_high_fidelity_no_data(
     output_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
     summary_text = render_high_fidelity_no_data_summary(artifact)
     summary_path.write_text(summary_text, encoding="utf-8")
-    progress_tracker.set_phase("done")
     progress_tracker.close()
     return artifact
 
@@ -772,6 +935,62 @@ def run_single_scenario(
     return {"trace": trace, "summary": summary}
 
 
+def _wheel_surface_temperature_c(state) -> float:
+    if state.thermal_field_rtw_k is not None:
+        return float(np.mean(state.thermal_field_rtw_k[-1, :, :]) - 273.15)
+    return float(np.mean(state.temperature_nodes_k[:3]) - 273.15)
+
+
+def _state_mean_core_surface_temperatures_c(state) -> tuple[float, float]:
+    core_temps_c = [wheel_state.core_temperature_c for wheel_state in state.wheel_states.values()]
+    surface_temps_c = [_wheel_surface_temperature_c(wheel_state) for wheel_state in state.wheel_states.values()]
+    return float(np.mean(core_temps_c)), float(np.mean(surface_temps_c))
+
+
+def run_single_scenario_temperature_trace(
+    *,
+    scenario: ScenarioConfig,
+    tire_parameters: HighFidelityTireModelParameters,
+    vehicle_parameters: VehicleParameters,
+    dt_s: float,
+    diagnostics_stride: int = 1,
+    simulator: HighFidelityVehicleSimulator | None = None,
+    inputs: VehicleInputs | None = None,
+    prepared_inputs=None,
+) -> dict[str, list[float] | float]:
+    active_simulator = simulator if simulator is not None else _vehicle_simulator(
+        tire_parameters=tire_parameters,
+        vehicle_parameters=vehicle_parameters,
+    )
+    active_inputs = inputs if inputs is not None else _vehicle_inputs_for_scenario(scenario)
+    active_prepared_inputs = (
+        active_simulator.prepare_inputs(active_inputs) if prepared_inputs is None else prepared_inputs
+    )
+    state = active_simulator.initial_state(ambient_temp_k=scenario.ambient_temp_k)
+
+    steps = max(int(round(scenario.duration_s / dt_s)), 1)
+    mean_core_temp_c: list[float] = []
+    mean_surface_temp_c: list[float] = []
+
+    initial_core_c, initial_surface_c = _state_mean_core_surface_temperatures_c(state)
+    mean_core_temp_c.append(initial_core_c)
+    mean_surface_temp_c.append(initial_surface_c)
+
+    diagnostics_stride = max(int(diagnostics_stride), 1)
+    for step in range(1, steps + 1):
+        state = active_simulator.step(state, active_inputs, dt_s=dt_s, prepared_inputs=active_prepared_inputs)
+        if step % diagnostics_stride == 0 or step == steps:
+            mean_core_c, mean_surface_c = _state_mean_core_surface_temperatures_c(state)
+            mean_core_temp_c.append(mean_core_c)
+            mean_surface_temp_c.append(mean_surface_c)
+
+    return {
+        "mean_core_temp_c": mean_core_temp_c,
+        "mean_surface_temp_c": mean_surface_temp_c,
+        "peak_mean_surface_temp_c": float(max(mean_surface_temp_c)),
+    }
+
+
 def run_lhs_uq(
     *,
     scenarios: tuple[ScenarioConfig, ...],
@@ -806,27 +1025,43 @@ def run_lhs_uq(
     if progress_tracker is not None:
         progress_tracker.set_phase("lhs")
     if workers > 1 and lhs_samples > 1:
-        tasks = _batched_uq_tasks(
-            items=sample_payloads,
-            workers=workers,
-            base_task={
-                "scenarios": scenarios,
-                "scenario_inputs": scenario_inputs,
-                "tire_parameters": tire_parameters,
+        progress_queue, drainer = _parallel_progress_context(
+            progress_tracker=progress_tracker,
+            pool_runner=pool_runner,
+        )
+        try:
+            global _WORKER_PROGRESS_QUEUE
+            _WORKER_PROGRESS_QUEUE = progress_queue
+            tasks = _batched_uq_tasks(
+                items=sample_payloads,
+                workers=workers,
+                base_task={
+                    "scenarios": scenarios,
+                    "scenario_inputs": scenario_inputs,
+                    "tire_parameters": tire_parameters,
                 "vehicle_parameters": vehicle_parameters,
                 "dt_s": dt_s,
                 "diagnostics_stride": diagnostics_stride,
-            },
-        )
-        for batch_result in _iter_parallel_map(
-            worker_fn=_evaluate_lhs_batch,
-            tasks=tasks,
-            workers=workers,
-            pool_runner=pool_runner,
-        ):
-            lhs_results.extend(batch_result)
-            if progress_tracker is not None:
-                progress_tracker.advance(len(batch_result))
+                },
+            )
+            if drainer is not None and hasattr(pool_runner, "restart"):
+                pool_runner.restart()
+            for batch_result in _iter_parallel_map(
+                worker_fn=_evaluate_lhs_batch,
+                tasks=tasks,
+                workers=workers,
+                pool_runner=pool_runner,
+            ):
+                lhs_results.extend(batch_result)
+                if drainer is None and progress_tracker is not None:
+                    progress_tracker.advance(len(batch_result))
+        finally:
+            _WORKER_PROGRESS_QUEUE = None
+            if drainer is not None:
+                drainer.stop()
+            if progress_queue is not None:
+                progress_queue.close()
+                progress_queue.join_thread()
     else:
         for sample_idx, sample in sample_payloads:
             lhs_results.append(
@@ -844,7 +1079,7 @@ def run_lhs_uq(
                 )
             )
             if progress_tracker is not None:
-                progress_tracker.advance(1)
+                progress_tracker.advance(len(scenarios))
 
     lhs_results.sort(key=lambda item: item[0])
     for _sample_idx, sample_result in lhs_results:
@@ -932,27 +1167,43 @@ def run_sobol_uq(
     if progress_tracker is not None:
         progress_tracker.set_phase("sobol")
     if workers > 1 and len(eval_payloads) > 1:
-        tasks = _batched_uq_tasks(
-            items=eval_payloads,
-            workers=workers,
-            base_task={
-                "scenario": scenario,
-                "scenario_inputs": scenario_inputs,
-                "tire_parameters": tire_parameters,
-                "vehicle_parameters": vehicle_parameters,
-                "dt_s": dt_s,
-                "diagnostics_stride": diagnostics_stride,
-            },
-        )
-        for batch_result in _iter_parallel_map(
-            worker_fn=_evaluate_sobol_batch,
-            tasks=tasks,
-            workers=workers,
+        progress_queue, drainer = _parallel_progress_context(
+            progress_tracker=progress_tracker,
             pool_runner=pool_runner,
-        ):
-            sobol_results.extend(batch_result)
-            if progress_tracker is not None:
-                progress_tracker.advance(len(batch_result))
+        )
+        try:
+            global _WORKER_PROGRESS_QUEUE
+            _WORKER_PROGRESS_QUEUE = progress_queue
+            tasks = _batched_uq_tasks(
+                items=eval_payloads,
+                workers=workers,
+                base_task={
+                    "scenario": scenario,
+                    "scenario_inputs": scenario_inputs,
+                    "tire_parameters": tire_parameters,
+                    "vehicle_parameters": vehicle_parameters,
+                    "dt_s": dt_s,
+                    "diagnostics_stride": diagnostics_stride,
+                },
+            )
+            if drainer is not None and hasattr(pool_runner, "restart"):
+                pool_runner.restart()
+            for batch_result in _iter_parallel_map(
+                worker_fn=_evaluate_sobol_batch,
+                tasks=tasks,
+                workers=workers,
+                pool_runner=pool_runner,
+            ):
+                sobol_results.extend(batch_result)
+                if drainer is None and progress_tracker is not None:
+                    progress_tracker.advance(len(batch_result))
+        finally:
+            _WORKER_PROGRESS_QUEUE = None
+            if drainer is not None:
+                drainer.stop()
+            if progress_queue is not None:
+                progress_queue.close()
+                progress_queue.join_thread()
     else:
         sobol_results = _evaluate_sobol_batch(
             {

@@ -11,9 +11,11 @@ import pytest
 from models.high_fidelity import HighFidelityTireModelParameters, ThermalFieldSolver2D
 from models.high_fidelity.native_diffusion import (
     native_diffusion_available,
+    native_multi_substep_available,
     run_native_build_source_and_diffuse_implicit,
     run_native_build_source_field,
     run_native_diffuse_vectorized_implicit,
+    run_native_thermal_step_multi_substep,
 )
 from models.high_fidelity.native_simulator_kernels import native_simulator_kernels_available
 
@@ -38,6 +40,7 @@ def _normalized_artifact(path: Path) -> dict:
     metadata = payload.get("metadata", {})
     for key in ("created_at_utc", "results_path", "summary_path"):
         metadata.pop(key, None)
+    payload.pop("timing", None)
     return payload
 
 
@@ -48,11 +51,58 @@ def _normalized_summary(path: Path) -> str:
         if not line.startswith("- created_at_utc:")
         and not line.startswith("- results_json:")
         and not line.startswith("- summary_md:")
+        and not line.startswith("- total_elapsed_s:")
+        and not line.startswith("| baseline |")
+        and not line.startswith("| lhs |")
+        and not line.startswith("| sobol |")
+        and not line.startswith("| done |")
     )
 
 
 def _layer_source_weights_array() -> np.ndarray:
     return np.asarray([12_000.0, 8_500.0, 7_200.0, 5_600.0, 4_300.0], dtype=float)
+
+
+def _compressed_native_material_inputs(
+    solver: ThermalFieldSolver2D,
+    *,
+    wear: float,
+    grain_index_w: np.ndarray,
+    blister_index_w: np.ndarray,
+    age_index: float,
+) -> dict[str, object]:
+    compact = solver._native_thermal_material_inputs(
+        wear=wear,
+        grain_index_w=grain_index_w,
+        blister_index_w=blister_index_w,
+        age_index=age_index,
+    )
+    return {
+        "layer_slices": np.array(compact["layer_slices"], dtype=np.int64, copy=True),
+        "volumetric_heat_capacity_by_layer": np.array(
+            solver._native_material_property_arrays["volumetric_heat_capacity_by_layer"],
+            dtype=float,
+            copy=True,
+        ),
+        "k_r_base_by_layer": np.array(solver._native_material_property_arrays["k_r_base_by_layer"], dtype=float, copy=True),
+        "k_theta_base_by_layer": np.array(solver._native_material_property_arrays["k_theta_base_by_layer"], dtype=float, copy=True),
+        "k_w_base_by_layer": np.array(solver._native_material_property_arrays["k_w_base_by_layer"], dtype=float, copy=True),
+        "shoulder_bias_by_layer": np.array(solver._native_material_property_arrays["shoulder_bias_by_layer"], dtype=float, copy=True),
+        "center_bias_by_layer": np.array(solver._native_material_property_arrays["center_bias_by_layer"], dtype=float, copy=True),
+        "bead_bias_by_layer": np.array(solver._native_material_property_arrays["bead_bias_by_layer"], dtype=float, copy=True),
+        "temp_sensitivity_by_layer": np.array(solver._native_material_property_arrays["temp_sensitivity_by_layer"], dtype=float, copy=True),
+        "wear_sensitivity_by_layer": np.array(solver._native_material_property_arrays["wear_sensitivity_by_layer"], dtype=float, copy=True),
+        "reinforcement_density_by_layer": np.array(solver._native_material_property_arrays["reinforcement_density_by_layer"], dtype=float, copy=True),
+        "cord_angle_deg_by_layer": np.array(solver._native_material_property_arrays["cord_angle_deg_by_layer"], dtype=float, copy=True),
+        "grain_index_w": np.array(compact["grain_index_w"], dtype=float, copy=True),
+        "blister_index_w": np.array(compact["blister_index_w"], dtype=float, copy=True),
+        "wear": float(wear),
+        "age_index": float(age_index),
+        "construction_enabled": bool(solver.parameters.construction.enabled),
+        "construction_bead_width_fraction": float(solver.parameters.construction.bead_width_fraction),
+        "construction_temp_reference_k": float(solver.parameters.construction.temp_reference_k),
+        "tread_blister_conductivity_penalty": float(solver.parameters.surface_state.blister_conductivity_penalty),
+    }
 
 
 def test_diffusion_kernel_python_matches_stored_reference() -> None:
@@ -151,6 +201,13 @@ def test_native_source_field_matches_python_reference_when_available() -> None:
         "sidewall": 5_600.0,
         "inner_liner": 4_300.0,
     }
+    native_materials = _compressed_native_material_inputs(
+        solver,
+        wear=0.08,
+        grain_index_w=np.array([0.05, 0.02, 0.04], dtype=float),
+        blister_index_w=np.array([0.01, 0.03, 0.02], dtype=float),
+        age_index=0.15,
+    )
 
     python_source = solver.source_field_w_per_m3(
         volumetric_source_w_per_m3=18_500.0,
@@ -208,6 +265,13 @@ def test_native_source_and_diffusion_fused_path_matches_python_reference_when_av
         "sidewall": 5_600.0,
         "inner_liner": 4_300.0,
     }
+    native_materials = _compressed_native_material_inputs(
+        solver,
+        wear=0.08,
+        grain_index_w=np.array([0.05, 0.02, 0.04], dtype=float),
+        blister_index_w=np.array([0.01, 0.03, 0.02], dtype=float),
+        age_index=0.15,
+    )
 
     python_source = solver.source_field_w_per_m3(
         volumetric_source_w_per_m3=18_500.0,
@@ -255,6 +319,127 @@ def test_native_source_and_diffusion_fused_path_matches_python_reference_when_av
 
     assert native_iterations == python_iterations
     assert np.array_equal(native_source, python_source)
+    assert np.array_equal(native_field, python_field)
+
+
+def test_native_multi_substep_thermal_step_matches_python_reference_when_available() -> None:
+    if not native_diffusion_available() or not native_multi_substep_available():
+        return
+
+    params = HighFidelityTireModelParameters(
+        radial_cells=8,
+        theta_cells=16,
+        width_zones=3,
+        diffusion_max_iterations=10,
+        diffusion_tolerance_k=1e-6,
+        internal_solver_dt_s=0.01,
+    )
+    solver = ThermalFieldSolver2D(params)
+    rng = np.random.default_rng(20260309)
+    field = rng.normal(loc=343.15, scale=7.5, size=(params.radial_cells, params.theta_cells, params.width_zones)).astype(float)
+    extra_source = rng.normal(loc=420.0, scale=35.0, size=field.shape).astype(float)
+    rho_cp, k_r, k_theta, k_w, layer_index = solver.layer_property_maps(
+        wear=0.08,
+        grain_index_w=np.array([0.05, 0.02, 0.04], dtype=float),
+        blister_index_w=np.array([0.01, 0.03, 0.02], dtype=float),
+        age_index=0.15,
+    )
+    zone_weights = np.array([0.22, 0.51, 0.27], dtype=float)
+    layer_source_weights = {
+        "tread": 12_000.0,
+        "belt": 8_500.0,
+        "carcass": 7_200.0,
+        "sidewall": 5_600.0,
+        "inner_liner": 4_300.0,
+    }
+    native_materials = _compressed_native_material_inputs(
+        solver,
+        wear=0.08,
+        grain_index_w=np.array([0.05, 0.02, 0.04], dtype=float),
+        blister_index_w=np.array([0.01, 0.03, 0.02], dtype=float),
+        age_index=0.15,
+    )
+
+    python_field = np.array(field, dtype=float, copy=True)
+    python_expected_source_energy_j = 0.0
+    python_iterations = 0
+    substeps = max(int(round(0.04 / params.internal_solver_dt_s)), 1)
+    dt_sub = 0.04 / substeps
+    for sub_idx in range(substeps):
+        t_sub = 0.31 + sub_idx * dt_sub
+        python_field = solver._advect_theta_periodic(python_field, omega=187.0, dt_s=dt_sub)
+        source = solver.source_field_w_per_m3(
+            volumetric_source_w_per_m3=18_500.0,
+            wheel_angular_speed_radps=187.0,
+            time_s=t_sub,
+            zone_weights=zone_weights,
+            layer_source_weights=layer_source_weights,
+        ) + extra_source
+        python_field, substep_iterations = solver._diffuse_vectorized_implicit_python(
+            python_field,
+            source_w_per_m3=source,
+            rho_cp=np.array(rho_cp, dtype=float, copy=True),
+            k_r=np.array(k_r, dtype=float, copy=True),
+            k_theta=np.array(k_theta, dtype=float, copy=True),
+            k_w=np.array(k_w, dtype=float, copy=True),
+            dt_s=dt_sub,
+        )
+        python_iterations += substep_iterations
+        python_expected_source_energy_j += dt_sub * solver._total_source_power_w(source)
+        np.clip(python_field, params.minimum_temperature_k, params.maximum_temperature_k, out=python_field)
+
+    native_field, native_iterations, native_source_energy_j, _initial_energy_j, _final_energy_j, _advection_time_s, _diffusion_time_s = (
+        run_native_thermal_step_multi_substep(
+            field=np.array(field, dtype=float, copy=True),
+            extra_source_w_per_m3=np.array(extra_source, dtype=float, copy=True),
+            cell_volumes_m3=np.array(solver._cell_volumes_m3, dtype=float, copy=True),
+            dt_s=0.04,
+            substeps=substeps,
+            radial_coeff_minus=np.array(solver._radial_coeff_minus, dtype=float, copy=True),
+            radial_coeff_plus=np.array(solver._radial_coeff_plus, dtype=float, copy=True),
+            theta_coeff=np.array(solver._theta_coeff, dtype=float, copy=True),
+            width_coeff_minus=np.array(solver._width_coeff_minus, dtype=float, copy=True),
+            width_coeff_plus=np.array(solver._width_coeff_plus, dtype=float, copy=True),
+            diffusion_max_iterations=int(params.diffusion_max_iterations),
+            diffusion_tolerance_k=float(params.diffusion_tolerance_k),
+            source_volumetric_fraction=float(params.source_volumetric_fraction),
+            volumetric_source_w_per_m3=18_500.0,
+            wheel_angular_speed_radps=187.0,
+            time_s=0.31,
+            theta_delta_rad=solver._theta_delta_rad,
+            patch_radial_indices=solver._patch_radial_indices,
+            theta_offsets=solver._theta_offsets,
+            width_indices=solver._width_indices,
+            layer_slices=native_materials["layer_slices"],
+            volumetric_heat_capacity_by_layer=native_materials["volumetric_heat_capacity_by_layer"],
+            k_r_base_by_layer=native_materials["k_r_base_by_layer"],
+            k_theta_base_by_layer=native_materials["k_theta_base_by_layer"],
+            k_w_base_by_layer=native_materials["k_w_base_by_layer"],
+            shoulder_bias_by_layer=native_materials["shoulder_bias_by_layer"],
+            center_bias_by_layer=native_materials["center_bias_by_layer"],
+            bead_bias_by_layer=native_materials["bead_bias_by_layer"],
+            temp_sensitivity_by_layer=native_materials["temp_sensitivity_by_layer"],
+            wear_sensitivity_by_layer=native_materials["wear_sensitivity_by_layer"],
+            reinforcement_density_by_layer=native_materials["reinforcement_density_by_layer"],
+            cord_angle_deg_by_layer=native_materials["cord_angle_deg_by_layer"],
+            grain_index_w=native_materials["grain_index_w"],
+            blister_index_w=native_materials["blister_index_w"],
+            wear=native_materials["wear"],
+            age_index=native_materials["age_index"],
+            construction_enabled=native_materials["construction_enabled"],
+            construction_bead_width_fraction=native_materials["construction_bead_width_fraction"],
+            construction_temp_reference_k=native_materials["construction_temp_reference_k"],
+            tread_blister_conductivity_penalty=native_materials["tread_blister_conductivity_penalty"],
+            zone_weights=zone_weights,
+            layer_source_weights=_layer_source_weights_array(),
+            minimum_temperature_k=float(params.minimum_temperature_k),
+            maximum_temperature_k=float(params.maximum_temperature_k),
+            enable_profiling=False,
+        )
+    )
+
+    assert native_iterations == python_iterations
+    assert native_source_energy_j == pytest.approx(python_expected_source_energy_j, rel=0.0, abs=1e-12)
     assert np.array_equal(native_field, python_field)
 
 

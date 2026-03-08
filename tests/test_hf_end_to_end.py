@@ -39,6 +39,7 @@ def _normalized_artifact(payload: dict) -> dict:
     metadata = normalized.get("metadata", {})
     for key in ("created_at_utc", "results_path", "summary_path"):
         metadata.pop(key, None)
+    normalized.pop("timing", None)
     return normalized
 
 
@@ -49,6 +50,11 @@ def _normalized_summary(text: str) -> str:
         if not line.startswith("- created_at_utc:")
         and not line.startswith("- results_json:")
         and not line.startswith("- summary_md:")
+        and not line.startswith("- total_elapsed_s:")
+        and not line.startswith("| baseline |")
+        and not line.startswith("| lhs |")
+        and not line.startswith("| sobol |")
+        and not line.startswith("| done |")
     )
 
 
@@ -62,6 +68,12 @@ class _RecordingProgressTracker:
 
     def advance(self, amount: int = 1) -> None:
         self.advances.append(amount)
+
+    def close(self) -> None:
+        return None
+
+    def timings(self) -> dict:
+        return {"total_elapsed_s": 0.0, "phases": {}}
 
 
 def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path) -> None:
@@ -96,6 +108,8 @@ def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path
     assert payload["metadata"]["diagnostics_stride"] == 1
     assert payload["metadata"]["radial_cells"] == 4
     assert payload["metadata"]["theta_cells"] == 8
+    assert payload["timing"]["total_elapsed_s"] >= 0.0
+    assert set(payload["timing"]["phases"]) >= {"baseline", "lhs", "sobol", "done"}
     assert "scenario_envelopes" in payload["uq"]["lhs"]
     assert len(payload["uq"]["sobol"]["indices"]) > 0
     assert "all_outputs_finite" in payload["plausibility_checks"]
@@ -109,6 +123,7 @@ def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path
     assert summary_text.startswith("# High-Fidelity No-Data Summary")
     assert "## UQ-First Scenario Metrics" in summary_text
     assert "## Sobol Ranking" in summary_text
+    assert "## Runtime Breakdown" in summary_text
 
 
 def test_p8_end_to_end_parallel_workers_match_serial_outputs(tmp_path: Path) -> None:
@@ -180,8 +195,100 @@ def test_p8_lhs_progress_advances_per_sample_in_serial_mode() -> None:
     )
 
     assert progress_tracker.phases == ["lhs"]
-    assert progress_tracker.advances == [1, 1, 1]
+    assert progress_tracker.advances == [5, 5, 5]
     assert len(result["scenario_envelopes"]) == len(scenarios)
+
+
+def test_p8_lhs_parallel_progress_advances_per_sample_before_batch_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    _root, run_module, _report_module = _load_modules()
+    progress_tracker = _RecordingProgressTracker()
+    scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    observed_advances_during_iteration: list[int] = []
+
+    def fake_iter_parallel_map(*, worker_fn, tasks, workers, pool_runner):
+        del workers, pool_runner
+        assert [len(task["batch"]) for task in tasks] == [2, 2]
+        for task in tasks:
+            batch_result = worker_fn(task)
+            observed_advances_during_iteration.append(sum(progress_tracker.advances))
+            yield batch_result
+
+    monkeypatch.setattr(run_module, "_iter_parallel_map", fake_iter_parallel_map)
+
+    result = run_module.run_lhs_uq(
+        scenarios=scenarios,
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        lhs_samples=4,
+        seed=77,
+        diagnostics_stride=1,
+        workers=2,
+        progress_tracker=progress_tracker,
+        pool_runner=object(),
+    )
+
+    assert progress_tracker.phases == ["lhs"]
+    assert sum(progress_tracker.advances) == 20
+    assert observed_advances_during_iteration[0] > 0
+    assert len(result["scenario_envelopes"]) == len(scenarios)
+
+
+def test_p8_lhs_parallel_progress_restarts_reused_pool_before_worker_queue_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, run_module, _report_module = _load_modules()
+    scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    restart_calls: list[str] = []
+
+    class FakeQueue:
+        def put(self, _value: int) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def join_thread(self) -> None:
+            return None
+
+    class FakeDrainer:
+        def stop(self) -> None:
+            return None
+
+    class FakePoolRunner:
+        def restart(self) -> None:
+            restart_calls.append("restart")
+
+    def fake_parallel_progress_context(*, progress_tracker, pool_runner):
+        del progress_tracker, pool_runner
+        return FakeQueue(), FakeDrainer()
+
+    def fake_iter_parallel_map(*, worker_fn, tasks, workers, pool_runner):
+        del workers, pool_runner
+        for task in tasks:
+            yield worker_fn(task)
+
+    monkeypatch.setattr(run_module, "_parallel_progress_context", fake_parallel_progress_context)
+    monkeypatch.setattr(run_module, "_iter_parallel_map", fake_iter_parallel_map)
+
+    run_module.run_lhs_uq(
+        scenarios=scenarios,
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        lhs_samples=4,
+        seed=77,
+        diagnostics_stride=1,
+        workers=2,
+        progress_tracker=_RecordingProgressTracker(),
+        pool_runner=FakePoolRunner(),
+    )
+
+    assert restart_calls == ["restart"]
 
 
 def test_p8_baseline_parallel_progress_updates_before_all_results_are_sorted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -423,6 +530,7 @@ def test_p8_end_to_end_harness_generates_results_and_report_fullish(tmp_path: Pa
     assert len(payload["uq"]["sobol"]["indices"]) > 0
     assert "all_peak_core_finite" in payload["plausibility_checks"]
     assert "all_outputs_finite" in payload["plausibility_checks"]
+    assert set(payload["timing"]["phases"]) >= {"baseline", "lhs", "sobol", "done"}
     assert "peak_mean_surface_temp_c" in payload["baseline"]["scenario_summaries"]["steady_corner"]
     assert (
         payload["baseline"]["scenario_summaries"]["long_stint"]["end_mean_core_temp_c"]
@@ -442,4 +550,5 @@ def test_p8_end_to_end_harness_generates_results_and_report_fullish(tmp_path: Pa
     assert summary_text.startswith("# High-Fidelity No-Data Summary")
     assert "## UQ-First Scenario Metrics" in summary_text
     assert "## Sobol Ranking" in summary_text
+    assert "## Runtime Breakdown" in summary_text
     assert "peak_mean_surface_temp_c" in summary_text

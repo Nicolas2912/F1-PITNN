@@ -9,8 +9,10 @@ import numpy as np
 from .native_diffusion import (
     native_diffusion_available,
     native_diffusion_enabled,
+    native_multi_substep_available,
     run_native_build_source_and_diffuse_implicit,
     run_native_diffuse_vectorized_implicit,
+    run_native_thermal_step_multi_substep,
 )
 from .types import HighFidelityTireInputs, HighFidelityTireModelParameters
 
@@ -61,6 +63,7 @@ class ThermalFieldSolver2D:
         self._dw_m = np.diff(self._width_edges)
         self._width_indices = np.arange(self.parameters.width_zones, dtype=int)
         self._cell_volumes_m3 = self._build_cell_volumes_m3()
+        self._total_volume_m3 = float(np.sum(self._cell_volumes_m3))
         self._surface_cell_areas_m2 = self._build_surface_cell_areas_m2()
         self._radial_coeff_minus, self._radial_coeff_plus = self._build_radial_diffusion_coefficients()
         self._theta_coeff = self._build_theta_diffusion_coefficients()
@@ -85,6 +88,7 @@ class ThermalFieldSolver2D:
         self._scratch_k_w = np.zeros(self._scratch_shape, dtype=float)
         self._layer_layout_cache: dict[tuple[int, ...], _LayerLayout] = {}
         self._ones_width = np.ones(self.parameters.width_zones, dtype=float)
+        self._zeros_width = np.zeros(self.parameters.width_zones, dtype=float)
         self._patch_theta_cells = max(1, int(round(self.parameters.theta_cells * self.parameters.source_patch_theta_fraction)))
         self._patch_radial_cells = max(1, int(round(self.parameters.radial_cells * self.parameters.source_patch_radial_fraction)))
         self._patch_radial_start = max(self.parameters.radial_cells - self._patch_radial_cells, 0)
@@ -96,6 +100,8 @@ class ThermalFieldSolver2D:
         )
         self._width_positions = np.linspace(-1.0, 1.0, self.parameters.width_zones, dtype=float) if self.parameters.width_zones > 1 else np.zeros(1, dtype=float)
         self._source_layer_masks = self._build_source_layer_masks()
+        self._native_material_property_arrays = self._build_native_material_property_arrays()
+        self._source_patch_volume_by_zone_m3 = self._build_source_patch_volume_by_zone_m3()
 
     @property
     def radial_centers_m(self) -> np.ndarray:
@@ -323,13 +329,6 @@ class ThermalFieldSolver2D:
         if extra_source_w_per_m3 is not None:
             self._validate_field_shape(extra_source_w_per_m3)
 
-        rho_cp, k_r, k_theta, k_w, layer_index = self.layer_property_maps(
-            wear=wear,
-            grain_index_w=grain_index_w,
-            blister_index_w=blister_index_w,
-            age_index=age_index,
-        )
-
         omega = inputs.wheel_angular_speed_radps
         use_native_diffusion = native_diffusion_enabled() and native_diffusion_available()
         max_cfl = abs(omega) * dt_s / max(self._theta_delta_rad, 1e-9)
@@ -346,27 +345,23 @@ class ThermalFieldSolver2D:
         minimum_temperature_k = self.parameters.minimum_temperature_k
         maximum_temperature_k = self.parameters.maximum_temperature_k
 
-        expected_energy_j = self._total_energy_j(field, rho_cp=rho_cp)
         advection_time_s = 0.0
         diffusion_time_s = 0.0
         diffusion_iterations = 0
-        for sub_idx in range(substeps):
-            t_sub = time_s + sub_idx * dt_sub
-            start = time.perf_counter() if self.parameters.enable_profiling else 0.0
-            field = self._advect_theta_periodic(field, omega=omega, dt_s=dt_sub)
-            if self.parameters.enable_profiling:
-                advection_time_s += time.perf_counter() - start
-
-            if use_native_diffusion:
-                start = time.perf_counter() if self.parameters.enable_profiling else 0.0
-                field, substep_iterations, source = run_native_build_source_and_diffuse_implicit(
+        if use_native_diffusion and native_multi_substep_available():
+            native_materials = self._native_thermal_material_inputs(
+                wear=wear,
+                grain_index_w=grain_index_w,
+                blister_index_w=blister_index_w,
+                age_index=age_index,
+            )
+            field, diffusion_iterations, _source_energy_j, _initial_energy_j, _final_energy_j, native_advection_time_s, native_diffusion_time_s = (
+                run_native_thermal_step_multi_substep(
                     field=field,
                     extra_source_w_per_m3=extra_source_w_per_m3,
-                    rho_cp=rho_cp,
-                    k_r=k_r,
-                    k_theta=k_theta,
-                    k_w=k_w,
-                    dt_s=dt_sub,
+                    cell_volumes_m3=self._cell_volumes_m3,
+                    dt_s=dt_s,
+                    substeps=substeps,
                     radial_coeff_minus=self._radial_coeff_minus,
                     radial_coeff_plus=self._radial_coeff_plus,
                     theta_coeff=self._theta_coeff,
@@ -377,44 +372,124 @@ class ThermalFieldSolver2D:
                     source_volumetric_fraction=source_volumetric_fraction,
                     volumetric_source_w_per_m3=float(volumetric_source_w_per_m3),
                     wheel_angular_speed_radps=float(omega),
-                    time_s=float(t_sub),
+                    time_s=float(time_s),
                     theta_delta_rad=theta_delta_rad,
                     patch_radial_indices=self._patch_radial_indices,
                     theta_offsets=self._theta_offsets,
                     width_indices=self._width_indices,
-                    layer_index=layer_index,
+                    layer_slices=native_materials["layer_slices"],
+                    volumetric_heat_capacity_by_layer=self._native_material_property_arrays["volumetric_heat_capacity_by_layer"],
+                    k_r_base_by_layer=self._native_material_property_arrays["k_r_base_by_layer"],
+                    k_theta_base_by_layer=self._native_material_property_arrays["k_theta_base_by_layer"],
+                    k_w_base_by_layer=self._native_material_property_arrays["k_w_base_by_layer"],
+                    shoulder_bias_by_layer=self._native_material_property_arrays["shoulder_bias_by_layer"],
+                    center_bias_by_layer=self._native_material_property_arrays["center_bias_by_layer"],
+                    bead_bias_by_layer=self._native_material_property_arrays["bead_bias_by_layer"],
+                    temp_sensitivity_by_layer=self._native_material_property_arrays["temp_sensitivity_by_layer"],
+                    wear_sensitivity_by_layer=self._native_material_property_arrays["wear_sensitivity_by_layer"],
+                    reinforcement_density_by_layer=self._native_material_property_arrays["reinforcement_density_by_layer"],
+                    cord_angle_deg_by_layer=self._native_material_property_arrays["cord_angle_deg_by_layer"],
+                    grain_index_w=native_materials["grain_index_w"],
+                    blister_index_w=native_materials["blister_index_w"],
+                    wear=float(wear),
+                    age_index=float(age_index),
+                    construction_enabled=bool(self.parameters.construction.enabled),
+                    construction_bead_width_fraction=float(self.parameters.construction.bead_width_fraction),
+                    construction_temp_reference_k=float(self.parameters.construction.temp_reference_k),
+                    tread_blister_conductivity_penalty=float(self.parameters.surface_state.blister_conductivity_penalty),
                     zone_weights=zone_source_weights,
                     layer_source_weights=layer_source_weights_array,
+                    minimum_temperature_k=minimum_temperature_k,
+                    maximum_temperature_k=maximum_temperature_k,
+                    enable_profiling=bool(self.parameters.enable_profiling),
                 )
-            else:
-                source = self.source_field_w_per_m3(
-                    volumetric_source_w_per_m3=volumetric_source_w_per_m3,
-                    wheel_angular_speed_radps=omega,
-                    time_s=t_sub,
-                    zone_weights=zone_source_weights,
-                    layer_source_weights=layer_source_weights,
-                )
-                if extra_source_w_per_m3 is not None:
-                    source = source + extra_source_w_per_m3
-
+            )
+            expected_energy_j = self._total_energy_j_compact(field=np.array(base_field, dtype=float, copy=False), rho_cp_r=native_materials["rho_cp_r"])
+            source_power_w = self._source_power_w_compact(
+                volumetric_source_w_per_m3=volumetric_source_w_per_m3,
+                layer_slices=native_materials["layer_slices"],
+                zone_weights=zone_source_weights,
+                layer_source_weights=layer_source_weights,
+                extra_source_w_per_m3=extra_source_w_per_m3,
+            )
+            for _ in range(substeps):
+                expected_energy_j += dt_sub * source_power_w
+            actual_energy_j = self._total_energy_j_compact(field=field, rho_cp_r=native_materials["rho_cp_r"])
+            advection_time_s += native_advection_time_s
+            diffusion_time_s += native_diffusion_time_s
+        else:
+            rho_cp, k_r, k_theta, k_w, layer_index = self.layer_property_maps(
+                wear=wear,
+                grain_index_w=grain_index_w,
+                blister_index_w=blister_index_w,
+                age_index=age_index,
+            )
+            expected_energy_j = self._total_energy_j(field, rho_cp=rho_cp)
+            for sub_idx in range(substeps):
+                t_sub = time_s + sub_idx * dt_sub
                 start = time.perf_counter() if self.parameters.enable_profiling else 0.0
-                field, substep_iterations = self._diffuse_vectorized_implicit(
-                    field,
-                    source_w_per_m3=source,
-                    rho_cp=rho_cp,
-                    k_r=k_r,
-                    k_theta=k_theta,
-                    k_w=k_w,
-                    dt_s=dt_sub,
-                )
+                field = self._advect_theta_periodic(field, omega=omega, dt_s=dt_sub)
+                if self.parameters.enable_profiling:
+                    advection_time_s += time.perf_counter() - start
 
-            diffusion_iterations += substep_iterations
-            expected_energy_j += dt_sub * self._total_source_power_w(source)
-            if self.parameters.enable_profiling:
-                diffusion_time_s += time.perf_counter() - start
-            np.clip(field, minimum_temperature_k, maximum_temperature_k, out=field)
+                if use_native_diffusion:
+                    start = time.perf_counter() if self.parameters.enable_profiling else 0.0
+                    field, substep_iterations, source = run_native_build_source_and_diffuse_implicit(
+                        field=field,
+                        extra_source_w_per_m3=extra_source_w_per_m3,
+                        rho_cp=rho_cp,
+                        k_r=k_r,
+                        k_theta=k_theta,
+                        k_w=k_w,
+                        dt_s=dt_sub,
+                        radial_coeff_minus=self._radial_coeff_minus,
+                        radial_coeff_plus=self._radial_coeff_plus,
+                        theta_coeff=self._theta_coeff,
+                        width_coeff_minus=self._width_coeff_minus,
+                        width_coeff_plus=self._width_coeff_plus,
+                        diffusion_max_iterations=diffusion_max_iterations,
+                        diffusion_tolerance_k=diffusion_tolerance_k,
+                        source_volumetric_fraction=source_volumetric_fraction,
+                        volumetric_source_w_per_m3=float(volumetric_source_w_per_m3),
+                        wheel_angular_speed_radps=float(omega),
+                        time_s=float(t_sub),
+                        theta_delta_rad=theta_delta_rad,
+                        patch_radial_indices=self._patch_radial_indices,
+                        theta_offsets=self._theta_offsets,
+                        width_indices=self._width_indices,
+                        layer_index=layer_index,
+                        zone_weights=zone_source_weights,
+                        layer_source_weights=layer_source_weights_array,
+                    )
+                else:
+                    source = self.source_field_w_per_m3(
+                        volumetric_source_w_per_m3=volumetric_source_w_per_m3,
+                        wheel_angular_speed_radps=omega,
+                        time_s=t_sub,
+                        zone_weights=zone_source_weights,
+                        layer_source_weights=layer_source_weights,
+                    )
+                    if extra_source_w_per_m3 is not None:
+                        source = source + extra_source_w_per_m3
 
-        actual_energy_j = self._total_energy_j(field, rho_cp=rho_cp)
+                    start = time.perf_counter() if self.parameters.enable_profiling else 0.0
+                    field, substep_iterations = self._diffuse_vectorized_implicit(
+                        field,
+                        source_w_per_m3=source,
+                        rho_cp=rho_cp,
+                        k_r=k_r,
+                        k_theta=k_theta,
+                        k_w=k_w,
+                        dt_s=dt_sub,
+                    )
+
+                diffusion_iterations += substep_iterations
+                expected_energy_j += dt_sub * self._total_source_power_w(source)
+                if self.parameters.enable_profiling:
+                    diffusion_time_s += time.perf_counter() - start
+                np.clip(field, minimum_temperature_k, maximum_temperature_k, out=field)
+            actual_energy_j = self._total_energy_j(field, rho_cp=rho_cp)
+
         energy_residual_pct = abs(actual_energy_j - expected_energy_j) / max(abs(expected_energy_j), 1.0) * 100.0
         return ThermalSolverStepResult(
             temperature_field_rtw_k=field,
@@ -535,6 +610,12 @@ class ThermalFieldSolver2D:
         for w in range(width_zones):
             areas[:, w] = surface_arc_length_m * self._dw_m[w]
         return areas
+
+    def _build_source_patch_volume_by_zone_m3(self) -> np.ndarray:
+        if self._patch_radial_indices.size == 0:
+            return np.zeros(self.parameters.width_zones, dtype=float)
+        base_theta_volumes = self._cell_volumes_m3[self._patch_radial_indices, 0, :]
+        return np.sum(base_theta_volumes, axis=0) * self._theta_offsets.size
 
     def _build_radial_diffusion_coefficients(self) -> tuple[np.ndarray, np.ndarray]:
         radial_cells = self.parameters.radial_cells
@@ -789,6 +870,58 @@ class ThermalFieldSolver2D:
     def _total_source_power_w(self, source_w_per_m3: np.ndarray) -> float:
         return float(np.sum(source_w_per_m3 * self._cell_volumes_m3))
 
+    def _total_energy_j_compact(self, *, field: np.ndarray, rho_cp_r: np.ndarray) -> float:
+        return float(np.sum(field * rho_cp_r[:, None, None] * self._cell_volumes_m3))
+
+    def _source_power_w_compact(
+        self,
+        *,
+        volumetric_source_w_per_m3: float,
+        layer_slices: np.ndarray,
+        zone_weights: np.ndarray | None,
+        layer_source_weights: dict[str, float] | None,
+        extra_source_w_per_m3: np.ndarray | None,
+    ) -> float:
+        clamped_source = max(float(volumetric_source_w_per_m3), 0.0)
+        volumetric_fraction = max(float(self.parameters.source_volumetric_fraction), 0.0)
+        total_power = 0.0
+        if layer_source_weights:
+            weights = self._layer_source_weights_array(layer_source_weights)
+            assert weights is not None
+            total_weight = max(float(np.sum(weights)), 1e-12)
+            layer_weight_by_code = np.asarray(
+                [weights[0], weights[1], weights[2] + weights[3], weights[4]],
+                dtype=float,
+            )
+            for layer_code, (start, stop) in enumerate(np.asarray(layer_slices, dtype=int)):
+                if start >= stop or layer_weight_by_code[layer_code] <= 0.0:
+                    continue
+                layer_volume = float(np.sum(self._cell_volumes_m3[start:stop, :, :]))
+                total_power += (
+                    clamped_source
+                    * volumetric_fraction
+                    * (layer_weight_by_code[layer_code] / total_weight)
+                    * layer_volume
+                )
+        else:
+            total_power += clamped_source * volumetric_fraction * self._total_volume_m3
+
+        source_remaining = clamped_source * max(1.0 - volumetric_fraction, 0.0)
+        if source_remaining > 0.0:
+            weights = (
+                np.full(self.parameters.width_zones, 1.0 / max(self.parameters.width_zones, 1), dtype=float)
+                if zone_weights is None
+                else np.asarray(zone_weights, dtype=float)
+            )
+            weights = weights / max(float(np.sum(weights)), 1e-12)
+            patch_cells = self._patch_radial_indices.size * self._theta_offsets.size * self.parameters.width_zones
+            patch_extra_density = source_remaining * (self.parameters.radial_cells * self.parameters.theta_cells) / max(patch_cells, 1)
+            total_power += patch_extra_density * float(np.dot(weights, self._source_patch_volume_by_zone_m3))
+
+        if extra_source_w_per_m3 is not None:
+            total_power += float(np.sum(extra_source_w_per_m3 * self._cell_volumes_m3))
+        return float(total_power)
+
     def _layer_source_weights_array(
         self,
         layer_source_weights: dict[str, float] | None,
@@ -805,6 +938,62 @@ class ThermalFieldSolver2D:
             ],
             dtype=float,
         )
+
+    def _build_native_material_property_arrays(self) -> dict[str, np.ndarray]:
+        materials = (
+            self.parameters.layer_stack.tread,
+            self.parameters.layer_stack.belt,
+            self.parameters.layer_stack.carcass,
+            self.parameters.layer_stack.inner_liner,
+        )
+        return {
+            "volumetric_heat_capacity_by_layer": np.asarray(
+                [material.volumetric_heat_capacity_j_per_m3k for material in materials],
+                dtype=float,
+            ),
+            "k_r_base_by_layer": np.asarray([material.k_r_w_per_mk for material in materials], dtype=float),
+            "k_theta_base_by_layer": np.asarray([material.k_theta_w_per_mk for material in materials], dtype=float),
+            "k_w_base_by_layer": np.asarray([material.k_w_w_per_mk for material in materials], dtype=float),
+            "shoulder_bias_by_layer": np.asarray([material.shoulder_conductivity_bias for material in materials], dtype=float),
+            "center_bias_by_layer": np.asarray([material.center_conductivity_bias for material in materials], dtype=float),
+            "bead_bias_by_layer": np.asarray([material.bead_conductivity_bias for material in materials], dtype=float),
+            "temp_sensitivity_by_layer": np.asarray([material.temp_conductivity_sensitivity_per_k for material in materials], dtype=float),
+            "wear_sensitivity_by_layer": np.asarray([material.wear_conductivity_sensitivity for material in materials], dtype=float),
+            "reinforcement_density_by_layer": np.asarray([material.reinforcement_density_factor for material in materials], dtype=float),
+            "cord_angle_deg_by_layer": np.asarray([material.cord_angle_deg for material in materials], dtype=float),
+        }
+
+    def _native_thermal_material_inputs(
+        self,
+        *,
+        wear: float,
+        grain_index_w: np.ndarray | None,
+        blister_index_w: np.ndarray | None,
+        age_index: float,
+    ) -> dict[str, np.ndarray | float]:
+        radial_layer_index = self._radial_layer_index_for_wear(wear=wear)
+        layer_slices = np.zeros((4, 2), dtype=np.int64)
+        for layer_code in range(4):
+            layer_rows = np.flatnonzero(radial_layer_index == layer_code)
+            if layer_rows.size == 0:
+                continue
+            layer_slices[layer_code, 0] = int(layer_rows[0])
+            layer_slices[layer_code, 1] = int(layer_rows[-1]) + 1
+        return {
+            "layer_slices": layer_slices,
+            "rho_cp_r": self._native_material_property_arrays["volumetric_heat_capacity_by_layer"][radial_layer_index] * (1.0 + 0.06 * max(float(age_index), 0.0)),
+            "grain_index_w": (
+                self._zeros_width
+                if grain_index_w is None
+                else np.asarray(grain_index_w, dtype=float)
+            ),
+            "blister_index_w": (
+                self._zeros_width
+                if blister_index_w is None
+                else np.asarray(blister_index_w, dtype=float)
+            ),
+            "age_index": float(age_index),
+        }
 
     def _construction_conductivity_scale(
         self,

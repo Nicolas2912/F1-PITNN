@@ -3,6 +3,7 @@ from __future__ import annotations
 
 def render_high_fidelity_no_data_summary(artifact: dict) -> str:
     metadata = artifact["metadata"]
+    timing = artifact.get("timing", {})
     scenario_summaries = artifact["baseline"]["scenario_summaries"]
     plausibility = artifact["plausibility_checks"]
     sobol = artifact["uq"]["sobol"]
@@ -77,6 +78,31 @@ def render_high_fidelity_no_data_summary(artifact: dict) -> str:
         lines.append(
             f"| {entry['name']} | {entry['first_order']:.6f} | {entry['total_order']:.6f} |"
         )
+
+    if timing:
+        lines.extend(
+            [
+                "",
+                "## Runtime Breakdown",
+                "",
+                f"- total_elapsed_s: {timing['total_elapsed_s']:.6f}",
+                "",
+                "| phase | elapsed_s | completed_units | total_units | avg_seconds_per_unit | throughput_units_per_s |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for phase_name, phase in timing.get("phases", {}).items():
+            avg_seconds = phase["avg_seconds_per_unit"]
+            throughput = phase["throughput_units_per_s"]
+            lines.append(
+                "| "
+                + f"{phase_name} | {phase['elapsed_s']:.6f} | "
+                + f"{phase['completed_units']} | {phase['total_units']} | "
+                + (f"{avg_seconds:.6f}" if avg_seconds is not None else "n/a")
+                + " | "
+                + (f"{throughput:.6f}" if throughput is not None else "n/a")
+                + " |"
+            )
 
     lines.extend(
         [
