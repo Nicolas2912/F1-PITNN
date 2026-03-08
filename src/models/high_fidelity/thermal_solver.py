@@ -338,12 +338,20 @@ class ThermalFieldSolver2D:
         )
 
         omega = inputs.wheel_angular_speed_radps
+        use_native_diffusion = native_diffusion_enabled() and native_diffusion_available()
         max_cfl = abs(omega) * dt_s / max(self._theta_delta_rad, 1e-9)
         substeps = min(
             max(1, math.ceil(dt_s / max(self.parameters.internal_solver_dt_s, 1e-6))),
             max(self.parameters.max_solver_substeps, 1),
         )
         dt_sub = dt_s / substeps
+        layer_source_weights_array = self._layer_source_weights_array(layer_source_weights)
+        diffusion_max_iterations = int(self.parameters.diffusion_max_iterations)
+        diffusion_tolerance_k = float(self.parameters.diffusion_tolerance_k)
+        source_volumetric_fraction = float(self.parameters.source_volumetric_fraction)
+        theta_delta_rad = float(self._theta_delta_rad)
+        minimum_temperature_k = self.parameters.minimum_temperature_k
+        maximum_temperature_k = self.parameters.maximum_temperature_k
 
         expected_energy_j = self._total_energy_j(field, rho_cp=rho_cp)
         advection_time_s = 0.0
@@ -356,7 +364,7 @@ class ThermalFieldSolver2D:
             if self.parameters.enable_profiling:
                 advection_time_s += time.perf_counter() - start
 
-            if native_diffusion_enabled() and native_diffusion_available():
+            if use_native_diffusion:
                 start = time.perf_counter() if self.parameters.enable_profiling else 0.0
                 field, substep_iterations, source = run_native_build_source_and_diffuse_implicit(
                     field=field,
@@ -371,19 +379,19 @@ class ThermalFieldSolver2D:
                     theta_coeff=self._theta_coeff,
                     width_coeff_minus=self._width_coeff_minus,
                     width_coeff_plus=self._width_coeff_plus,
-                    diffusion_max_iterations=int(self.parameters.diffusion_max_iterations),
-                    diffusion_tolerance_k=float(self.parameters.diffusion_tolerance_k),
-                    source_volumetric_fraction=float(self.parameters.source_volumetric_fraction),
+                    diffusion_max_iterations=diffusion_max_iterations,
+                    diffusion_tolerance_k=diffusion_tolerance_k,
+                    source_volumetric_fraction=source_volumetric_fraction,
                     volumetric_source_w_per_m3=float(volumetric_source_w_per_m3),
                     wheel_angular_speed_radps=float(omega),
                     time_s=float(t_sub),
-                    theta_delta_rad=float(self._theta_delta_rad),
+                    theta_delta_rad=theta_delta_rad,
                     patch_radial_indices=self._patch_radial_indices,
                     theta_offsets=self._theta_offsets,
                     width_indices=self._width_indices,
                     layer_index=layer_index,
                     zone_weights=zone_source_weights,
-                    layer_source_weights=self._layer_source_weights_array(layer_source_weights),
+                    layer_source_weights=layer_source_weights_array,
                 )
             else:
                 source = self.source_field_w_per_m3(
@@ -411,7 +419,7 @@ class ThermalFieldSolver2D:
             expected_energy_j += dt_sub * self._total_source_power_w(source)
             if self.parameters.enable_profiling:
                 diffusion_time_s += time.perf_counter() - start
-            np.clip(field, self.parameters.minimum_temperature_k, self.parameters.maximum_temperature_k, out=field)
+            np.clip(field, minimum_temperature_k, maximum_temperature_k, out=field)
 
         actual_energy_j = self._total_energy_j(field, rho_cp=rho_cp)
         energy_residual_pct = abs(actual_energy_j - expected_energy_j) / max(abs(expected_energy_j), 1.0) * 100.0

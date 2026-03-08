@@ -26,6 +26,12 @@ def native_diffusion_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _ensure_float_array(value: np.ndarray) -> np.ndarray:
+    if isinstance(value, np.ndarray) and value.dtype == float:
+        return value
+    return np.asarray(value, dtype=float)
+
+
 def run_native_diffuse_vectorized_implicit(
     *,
     field: np.ndarray,
@@ -62,7 +68,7 @@ def run_native_diffuse_vectorized_implicit(
         diffusion_max_iterations,
         diffusion_tolerance_k,
     )
-    return np.asarray(result_field, dtype=float), int(iterations)
+    return _ensure_float_array(result_field), int(iterations)
 
 
 def run_native_build_source_field(
@@ -101,7 +107,7 @@ def run_native_build_source_field(
         zone_weights,
         layer_source_weights,
     )
-    return np.asarray(result, dtype=float)
+    return _ensure_float_array(result)
 
 
 def run_native_build_source_and_diffuse_implicit(
@@ -163,7 +169,7 @@ def run_native_build_source_and_diffuse_implicit(
         layer_source_weights,
     )
     return (
-        np.asarray(result_field, dtype=float),
+        _ensure_float_array(result_field),
         int(iterations),
-        np.asarray(source_field, dtype=float),
+        _ensure_float_array(source_field),
     )
