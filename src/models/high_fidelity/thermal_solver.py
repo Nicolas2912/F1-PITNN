@@ -30,6 +30,14 @@ class ThermalSolverStepResult:
         return np.mean(self.temperature_field_rtw_k, axis=2)
 
 
+@dataclass(frozen=True)
+class _LayerLayout:
+    radial_layer_index: np.ndarray
+    layer_index: np.ndarray
+    rho_cp_base: np.ndarray
+    layer_slices: tuple[tuple[int, int], ...]
+
+
 class ThermalFieldSolver2D:
     """
     Layered 3D thermal solver on a radial x circumferential x width grid.
@@ -71,6 +79,12 @@ class ThermalFieldSolver2D:
         self._scratch_estimate = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_updated = np.zeros(self._scratch_shape, dtype=float)
         self._scratch_source = np.zeros(self._scratch_shape, dtype=float)
+        self._scratch_rho_cp = np.zeros(self._scratch_shape, dtype=float)
+        self._scratch_k_r = np.zeros(self._scratch_shape, dtype=float)
+        self._scratch_k_theta = np.zeros(self._scratch_shape, dtype=float)
+        self._scratch_k_w = np.zeros(self._scratch_shape, dtype=float)
+        self._layer_layout_cache: dict[tuple[int, ...], _LayerLayout] = {}
+        self._ones_width = np.ones(self.parameters.width_zones, dtype=float)
         self._patch_theta_cells = max(1, int(round(self.parameters.theta_cells * self.parameters.source_patch_theta_fraction)))
         self._patch_radial_cells = max(1, int(round(self.parameters.radial_cells * self.parameters.source_patch_radial_fraction)))
         self._patch_radial_start = max(self.parameters.radial_cells - self._patch_radial_cells, 0)
@@ -183,6 +197,7 @@ class ThermalFieldSolver2D:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         params = self.parameters
         width_zones = params.width_zones
+        layout = self._layer_layout_for_wear(wear=wear)
         grain_index = (
             np.zeros(width_zones, dtype=float)
             if grain_index_w is None
@@ -194,32 +209,11 @@ class ThermalFieldSolver2D:
             else np.asarray(blister_index_w, dtype=float)
         )
         construction = params.construction
-
-        radial_span = params.outer_radius_m - params.inner_radius_m
-        tread_thickness_m = params.surface_state.tread_thickness_m(wear)
         stack = params.layer_stack
-        thicknesses = np.array(
-            [
-                tread_thickness_m,
-                stack.belt.thickness_m,
-                stack.carcass.thickness_m,
-                stack.inner_liner.thickness_m,
-            ],
-            dtype=float,
-        )
-        total_stack = max(float(np.sum(thicknesses)), 1e-9)
-        thicknesses *= radial_span / total_stack
-        cumulative_depth = np.cumsum(thicknesses)
-        depth_from_outer = params.outer_radius_m - self._radial_centers_m
-        radial_layer_index = np.zeros(params.radial_cells, dtype=int)
-        radial_layer_index[depth_from_outer > cumulative_depth[0]] = 1
-        radial_layer_index[depth_from_outer > cumulative_depth[1]] = 2
-        radial_layer_index[depth_from_outer > cumulative_depth[2]] = 3
-
-        rho_cp = np.zeros_like(self._cell_volumes_m3)
-        k_r = np.zeros_like(self._cell_volumes_m3)
-        k_theta = np.zeros_like(self._cell_volumes_m3)
-        k_w = np.zeros_like(self._cell_volumes_m3)
+        rho_cp = self._scratch_rho_cp
+        k_r = self._scratch_k_r
+        k_theta = self._scratch_k_theta
+        k_w = self._scratch_k_w
 
         layer_params = (
             LayerEntry("tread", stack.tread),
@@ -228,14 +222,15 @@ class ThermalFieldSolver2D:
             LayerEntry("inner_liner", stack.inner_liner),
         )
         age_gain = 1.0 + 0.06 * max(age_index, 0.0)
+        np.multiply(layout.rho_cp_base, age_gain, out=rho_cp)
         tread_grain_penalty = 1.0 - 0.08 * grain_index
         tread_blister_penalty = 1.0 - params.surface_state.blister_conductivity_penalty * blister_index
         other_blister_penalty = 1.0 - 0.10 * blister_index
-        for layer_code, entry in enumerate(layer_params):
-            radial_mask = radial_layer_index == layer_code
-            if not np.any(radial_mask):
+        for layer_code, (entry, radial_slice) in enumerate(zip(layer_params, layout.layer_slices, strict=True)):
+            start, stop = radial_slice
+            if start >= stop:
                 continue
-            grain_penalty = tread_grain_penalty if entry.name == "tread" else np.ones(width_zones, dtype=float)
+            grain_penalty = tread_grain_penalty if entry.name == "tread" else self._ones_width
             blister_penalty = tread_blister_penalty if entry.name == "tread" else other_blister_penalty
             k_r_scale, k_theta_scale, k_w_scale = self._construction_conductivity_scale_array(
                 material=entry.material,
@@ -243,22 +238,20 @@ class ThermalFieldSolver2D:
                 temperature_k=params.construction.temp_reference_k,
                 construction_enabled=construction.enabled,
             )
-            rho_cp[radial_mask, :, :] = entry.material.volumetric_heat_capacity_j_per_m3k * age_gain
-            k_r[radial_mask, :, :] = np.maximum(
+            radial_view = slice(start, stop)
+            k_r[radial_view, :, :] = np.maximum(
                 entry.material.k_r_w_per_mk * grain_penalty * blister_penalty * k_r_scale,
                 1e-4,
             )[None, None, :]
-            k_theta[radial_mask, :, :] = np.maximum(
+            k_theta[radial_view, :, :] = np.maximum(
                 entry.material.k_theta_w_per_mk * grain_penalty * blister_penalty * k_theta_scale,
                 1e-4,
             )[None, None, :]
-            k_w[radial_mask, :, :] = np.maximum(
+            k_w[radial_view, :, :] = np.maximum(
                 entry.material.k_w_w_per_mk * blister_penalty * k_w_scale,
                 1e-4,
             )[None, None, :]
-
-        layer_index = np.broadcast_to(radial_layer_index[:, None, None], self._cell_volumes_m3.shape).copy()
-        return rho_cp, k_r, k_theta, k_w, layer_index
+        return rho_cp, k_r, k_theta, k_w, layout.layer_index
 
     def layer_conductivity_scale_summary(
         self,
@@ -287,7 +280,7 @@ class ThermalFieldSolver2D:
         temperature_field_rtw_k: np.ndarray,
         wear: float,
     ) -> dict[str, float]:
-        _, _, _, _, layer_index = self.layer_property_maps(wear=wear)
+        layer_index = self._layer_layout_for_wear(wear=wear).layer_index
         outputs: dict[str, float] = {}
         for layer_code, layer_name in enumerate(("tread", "belt", "carcass", "inner_liner")):
             mask = layer_index == layer_code
@@ -450,8 +443,74 @@ class ThermalFieldSolver2D:
         stretched = 1.0 - np.power(1.0 - x, bias)
         return params.inner_radius_m + stretched * (params.outer_radius_m - params.inner_radius_m)
 
+    def _radial_layer_index_for_wear(self, *, wear: float) -> np.ndarray:
+        params = self.parameters
+        radial_span = params.outer_radius_m - params.inner_radius_m
+        tread_thickness_m = params.surface_state.tread_thickness_m(wear)
+        stack = params.layer_stack
+        thicknesses = np.array(
+            [
+                tread_thickness_m,
+                stack.belt.thickness_m,
+                stack.carcass.thickness_m,
+                stack.inner_liner.thickness_m,
+            ],
+            dtype=float,
+        )
+        total_stack = max(float(np.sum(thicknesses)), 1e-9)
+        thicknesses *= radial_span / total_stack
+        cumulative_depth = np.cumsum(thicknesses)
+        depth_from_outer = params.outer_radius_m - self._radial_centers_m
+        radial_layer_index = np.zeros(params.radial_cells, dtype=int)
+        radial_layer_index[depth_from_outer > cumulative_depth[0]] = 1
+        radial_layer_index[depth_from_outer > cumulative_depth[1]] = 2
+        radial_layer_index[depth_from_outer > cumulative_depth[2]] = 3
+        return radial_layer_index
+
+    def _layer_layout_for_wear(self, *, wear: float) -> _LayerLayout:
+        radial_layer_index = self._radial_layer_index_for_wear(wear=wear)
+        cache_key = tuple(int(value) for value in radial_layer_index)
+        cached = self._layer_layout_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        radial_cells = self.parameters.radial_cells
+        theta_cells = self.parameters.theta_cells
+        width_zones = self.parameters.width_zones
+        layer_index = np.broadcast_to(
+            radial_layer_index[:, None, None],
+            (radial_cells, theta_cells, width_zones),
+        ).copy()
+        rho_cp_base = np.zeros(self._scratch_shape, dtype=float)
+        layer_slices: list[tuple[int, int]] = []
+        for layer_code, material in enumerate(
+            (
+                self.parameters.layer_stack.tread,
+                self.parameters.layer_stack.belt,
+                self.parameters.layer_stack.carcass,
+                self.parameters.layer_stack.inner_liner,
+            )
+        ):
+            layer_rows = np.flatnonzero(radial_layer_index == layer_code)
+            if layer_rows.size == 0:
+                layer_slices.append((0, 0))
+                continue
+            start = int(layer_rows[0])
+            stop = int(layer_rows[-1]) + 1
+            layer_slices.append((start, stop))
+            rho_cp_base[start:stop, :, :] = material.volumetric_heat_capacity_j_per_m3k
+
+        layout = _LayerLayout(
+            radial_layer_index=radial_layer_index.copy(),
+            layer_index=layer_index,
+            rho_cp_base=rho_cp_base,
+            layer_slices=tuple(layer_slices),
+        )
+        self._layer_layout_cache[cache_key] = layout
+        return layout
+
     def _build_source_layer_masks(self) -> tuple[np.ndarray | None, ...]:
-        _, _, _, _, layer_index = self.layer_property_maps(wear=0.0)
+        layer_index = self._layer_layout_for_wear(wear=0.0).layer_index
         return tuple(
             mask if np.any(mask) else None
             for mask in (layer_index == layer_code for layer_code in range(4))
