@@ -233,6 +233,107 @@ def test_p8_baseline_parallel_progress_updates_before_all_results_are_sorted(mon
     assert list(result["scenario_summaries"]) == [scenario.name for scenario in scenarios]
 
 
+def test_p8_end_to_end_parallel_reuses_single_process_pool(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _root, run_module, _report_module = _load_modules()
+    runner_count = 0
+    iter_calls: list[tuple[str, int]] = []
+
+    class FakeProcessPoolRunner:
+        def __init__(self, workers: int) -> None:
+            nonlocal runner_count
+            runner_count += 1
+            self.workers = workers
+            self.closed = False
+
+        def iter_map_unordered(self, worker_fn, tasks):
+            iter_calls.append((worker_fn.__name__, len(tasks)))
+            for task in tasks:
+                yield worker_fn(task)
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(run_module, "ProcessPoolRunner", FakeProcessPoolRunner)
+
+    run_module.run_high_fidelity_no_data(
+        preset="smoke",
+        output_path=tmp_path / "results.json",
+        summary_path=tmp_path / "summary.md",
+        seed=77,
+        dt_s=0.2,
+        duration_scale=0.05,
+        lhs_samples=2,
+        sobol_samples=2,
+        workers=2,
+        progress=False,
+    )
+
+    assert runner_count == 1
+    assert [name for name, _count in iter_calls] == [
+        "_run_scenario_task",
+        "_evaluate_lhs_batch",
+        "_evaluate_sobol_batch",
+    ]
+
+
+def test_p8_parallel_uq_batches_reduce_task_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    _root, run_module, _report_module = _load_modules()
+    scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    lhs_task_batches: list[int] = []
+    sobol_task_batches: list[int] = []
+    progress_tracker = _RecordingProgressTracker()
+
+    def fake_iter_parallel_map(*, worker_fn, tasks, workers, pool_runner):
+        del workers, pool_runner
+        batch_sizes = [len(task["batch"]) for task in tasks]
+        if worker_fn.__name__ == "_evaluate_lhs_batch":
+            lhs_task_batches.extend(batch_sizes)
+            for task in tasks:
+                yield worker_fn(task)
+            return
+        if worker_fn.__name__ == "_evaluate_sobol_batch":
+            sobol_task_batches.extend(batch_sizes)
+            for task in tasks:
+                yield worker_fn(task)
+            return
+        for task in tasks:
+            yield worker_fn(task)
+
+    monkeypatch.setattr(run_module, "_iter_parallel_map", fake_iter_parallel_map)
+
+    run_module.run_lhs_uq(
+        scenarios=scenarios,
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        lhs_samples=7,
+        seed=77,
+        diagnostics_stride=1,
+        workers=3,
+        progress_tracker=progress_tracker,
+        pool_runner=object(),
+    )
+    assert lhs_task_batches == [3, 3, 1]
+
+    progress_tracker = _RecordingProgressTracker()
+    run_module.run_sobol_uq(
+        scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        sobol_samples=3,
+        seed=77,
+        diagnostics_stride=1,
+        workers=4,
+        progress_tracker=progress_tracker,
+        pool_runner=object(),
+    )
+    assert sobol_task_batches == [19, 19, 19, 18]
+
+
 @pytest.mark.slow
 def test_p8_end_to_end_harness_generates_results_and_report_fullish(tmp_path: Path) -> None:
     root, run_module, report_module = _load_modules()
