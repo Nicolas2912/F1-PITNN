@@ -586,11 +586,11 @@ def _evaluate_lhs_batch(task: dict) -> list[tuple[int, dict[str, tuple[list[floa
     return outputs
 
 
-def _evaluate_sobol_batch(task: dict) -> list[tuple[int, float]]:
+def _evaluate_sobol_batch(task: dict) -> list[tuple[int, dict[str, float]]]:
     uq = HighFidelityUQ()
     scenario: ScenarioConfig = task["scenario"]
     scenario_inputs: VehicleInputs = task["scenario_inputs"]
-    outputs: list[tuple[int, float]] = []
+    outputs: list[tuple[int, dict[str, float]]] = []
     for eval_idx, sample in task["batch"]:
         sampled_tire_parameters = uq.apply_sample(base=task["tire_parameters"], sample=sample)
         simulator = _vehicle_simulator(
@@ -607,7 +607,15 @@ def _evaluate_sobol_batch(task: dict) -> list[tuple[int, float]]:
             inputs=scenario_inputs,
             prepared_inputs=simulator.prepare_inputs(scenario_inputs),
         )
-        outputs.append((eval_idx, float(result["peak_mean_surface_temp_c"])))
+        outputs.append((
+            eval_idx,
+            {
+                "peak_mean_surface_temp_c": float(result["peak_mean_surface_temp_c"]),
+                "peak_mean_core_temp_c": float(result["peak_mean_core_temp_c"]),
+                "end_mean_surface_temp_c": float(result["end_mean_surface_temp_c"]),
+                "end_mean_core_temp_c": float(result["end_mean_core_temp_c"]),
+            },
+        ))
         if _WORKER_PROGRESS_QUEUE is not None:
             _WORKER_PROGRESS_QUEUE.put(1)
     return outputs
@@ -987,6 +995,9 @@ def run_single_scenario_temperature_trace(
     return {
         "mean_core_temp_c": mean_core_temp_c,
         "mean_surface_temp_c": mean_surface_temp_c,
+        "end_mean_core_temp_c": float(mean_core_temp_c[-1]),
+        "peak_mean_core_temp_c": float(max(mean_core_temp_c)),
+        "end_mean_surface_temp_c": float(mean_surface_temp_c[-1]),
         "peak_mean_surface_temp_c": float(max(mean_surface_temp_c)),
     }
 
@@ -1139,6 +1150,12 @@ def run_sobol_uq(
     progress_tracker: ProgressTracker | None = None,
     pool_runner: ProcessPoolRunner | None = None,
 ) -> dict:
+    metric_candidates = (
+        "peak_mean_surface_temp_c",
+        "peak_mean_core_temp_c",
+        "end_mean_surface_temp_c",
+        "end_mean_core_temp_c",
+    )
     priors = uq.default_tire_priors(parameters=tire_parameters)
     scenario_inputs = _vehicle_inputs_for_scenario(scenario)
     prior_names = tuple(prior.name for prior in priors)
@@ -1163,7 +1180,7 @@ def run_sobol_uq(
                 {name: float(value) for name, value in zip(prior_names, matrix_ab[row_idx], strict=True)},
             ))
 
-    sobol_results: list[tuple[int, float]] = []
+    sobol_results: list[tuple[int, dict[str, float]]] = []
     if progress_tracker is not None:
         progress_tracker.set_phase("sobol")
     if workers > 1 and len(eval_payloads) > 1:
@@ -1219,25 +1236,46 @@ def run_sobol_uq(
         if progress_tracker is not None:
             progress_tracker.advance(len(sobol_results))
 
-    ordered_results = np.zeros(len(eval_payloads), dtype=float)
-    for eval_idx, value in sobol_results:
-        ordered_results[eval_idx] = value
-    y_a = ordered_results[:sobol_samples]
-    y_b = ordered_results[sobol_samples : 2 * sobol_samples]
-    y_ab_by_dim = [
-        ordered_results[offset : offset + sobol_samples]
-        for offset in y_ab_offsets
-    ]
-    sobol = uq.sobol_indices_from_evaluations(
-        priors=priors,
-        y_a=y_a,
-        y_b=y_b,
-        y_ab_by_dim=y_ab_by_dim,
-    )
+    ordered_metrics = {
+        metric_name: np.zeros(len(eval_payloads), dtype=float)
+        for metric_name in metric_candidates
+    }
+    for eval_idx, values in sobol_results:
+        for metric_name in metric_candidates:
+            ordered_metrics[metric_name][eval_idx] = float(values[metric_name])
+
+    selected_metric = metric_candidates[0]
+    selected_sobol = None
+    fallback_metric = None
+    for metric_name in metric_candidates:
+        ordered_results = ordered_metrics[metric_name]
+        y_a = ordered_results[:sobol_samples]
+        y_b = ordered_results[sobol_samples : 2 * sobol_samples]
+        y_ab_by_dim = [
+            ordered_results[offset : offset + sobol_samples]
+            for offset in y_ab_offsets
+        ]
+        sobol = uq.sobol_indices_from_evaluations(
+            priors=priors,
+            y_a=y_a,
+            y_b=y_b,
+            y_ab_by_dim=y_ab_by_dim,
+        )
+        if fallback_metric is None:
+            fallback_metric = metric_name
+            selected_sobol = sobol
+        if sobol.variance > 1e-12:
+            selected_metric = metric_name
+            selected_sobol = sobol
+            break
+
+    assert selected_sobol is not None
+    if selected_sobol.variance <= 1e-12:
+        selected_metric = fallback_metric if fallback_metric is not None else metric_candidates[0]
     return {
-        "objective_metric": f"{scenario.name}.peak_mean_surface_temp_c",
-        "variance": sobol.variance,
-        "indices": [asdict(index) for index in sobol.indices],
+        "objective_metric": f"{scenario.name}.{selected_metric}",
+        "variance": selected_sobol.variance,
+        "indices": [asdict(index) for index in selected_sobol.indices],
     }
 
 

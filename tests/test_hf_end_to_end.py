@@ -291,6 +291,42 @@ def test_p8_lhs_parallel_progress_restarts_reused_pool_before_worker_queue_updat
     assert restart_calls == ["restart"]
 
 
+def test_p8_sobol_falls_back_from_degenerate_surface_metric(monkeypatch: pytest.MonkeyPatch) -> None:
+    _root, run_module, _report_module = _load_modules()
+
+    def fake_evaluate_sobol_batch(task: dict) -> list[tuple[int, dict[str, float]]]:
+        outputs: list[tuple[int, dict[str, float]]] = []
+        for eval_idx, _sample in task["batch"]:
+            outputs.append((
+                eval_idx,
+                {
+                    "peak_mean_surface_temp_c": 1926.85,
+                    "peak_mean_core_temp_c": float(eval_idx),
+                    "end_mean_surface_temp_c": 1926.85,
+                    "end_mean_core_temp_c": float(eval_idx) * 0.5,
+                },
+            ))
+        return outputs
+
+    monkeypatch.setattr(run_module, "_evaluate_sobol_batch", fake_evaluate_sobol_batch)
+
+    result = run_module.run_sobol_uq(
+        scenario=run_module.default_scenarios(duration_scale=0.05)[0],
+        tire_parameters=run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05),
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        sobol_samples=2,
+        seed=77,
+        diagnostics_stride=1,
+        workers=1,
+    )
+
+    assert result["objective_metric"].endswith(".peak_mean_core_temp_c")
+    assert result["variance"] > 0.0
+    assert any(index["total_order"] > 0.0 for index in result["indices"])
+
+
 def test_p8_baseline_parallel_progress_updates_before_all_results_are_sorted(monkeypatch: pytest.MonkeyPatch) -> None:
     _root, run_module, _report_module = _load_modules()
     scenarios = run_module.default_scenarios(duration_scale=0.05)[:3]
