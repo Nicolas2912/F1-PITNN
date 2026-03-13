@@ -545,3 +545,77 @@ def test_p3_flash_layer_runs_hotter_than_bulk_surface_under_slip_heating() -> No
     assert diag.flash_surface_temperature_k is not None
     assert np.max(state.flash_temperature_field_tw_k) > float(np.mean(state.thermal_field_rtw_k[-1, :, :]))
     assert diag.flash_surface_temperature_k - diag.surface_temperature_k > 2.0
+
+
+def test_p3_uniform_full_resolution_field_remains_uniform_without_sources() -> None:
+    params = HighFidelityTireModelParameters(
+        use_2d_thermal_solver=True,
+        no_op_thermal_step=False,
+        radial_cells=24,
+        theta_cells=72,
+        internal_solver_dt_s=0.01,
+    )
+    solver = ThermalFieldSolver2D(params)
+    field = solver.initial_temperature_field(celsius_to_kelvin(31.0))
+    control = _inputs(
+        speed_mps=60.0,
+        wheel_angular_speed_radps=181.8,
+        normal_load_n=3_900.0,
+        slip_ratio_cmd=0.0,
+        slip_angle_cmd_rad=0.0,
+        ambient_temp_k=celsius_to_kelvin(31.0),
+        track_temp_k=celsius_to_kelvin(31.0),
+        road_surface_temp_k=celsius_to_kelvin(31.0),
+        road_bulk_temp_k=celsius_to_kelvin(31.0),
+        wind_mps=0.0,
+    )
+
+    result = solver.step(
+        temperature_field_rtw_k=field,
+        inputs=control,
+        time_s=0.0,
+        dt_s=0.2,
+        volumetric_source_w_per_m3=0.0,
+    )
+
+    assert np.allclose(result.temperature_field_rtw_k, field, atol=1e-9, rtol=0.0)
+    assert result.energy_residual_pct < 1e-9
+
+
+def test_p3_structural_hysteresis_source_matches_solver_deposition_volume() -> None:
+    params = HighFidelityTireModelParameters(
+        use_2d_thermal_solver=True,
+        no_op_thermal_step=False,
+        use_local_temp_friction_partition=True,
+        use_reduced_patch_mechanics=True,
+        use_structural_hysteresis_model=True,
+        radial_cells=20,
+        theta_cells=60,
+        internal_solver_dt_s=0.01,
+    )
+    simulator = HighFidelityTireSimulator(params)
+    state = simulator.initial_state(ambient_temp_k=celsius_to_kelvin(31.0))
+    control = _inputs(
+        speed_mps=60.0,
+        wheel_angular_speed_radps=181.8,
+        normal_load_n=3_900.0,
+        slip_ratio_cmd=0.10,
+        slip_angle_cmd_rad=0.085,
+        ambient_temp_k=celsius_to_kelvin(31.0),
+        track_temp_k=celsius_to_kelvin(47.0),
+        road_surface_temp_k=celsius_to_kelvin(47.0),
+        road_bulk_temp_k=celsius_to_kelvin(42.0),
+        wind_mps=7.0,
+        solar_w_m2=260.0,
+        rubbering_level=0.72,
+        asphalt_roughness=1.05,
+        asphalt_effusivity=1.08,
+    )
+
+    for _ in range(4):
+        state = simulator.step(state, control, dt_s=0.2)
+
+    diag = simulator.diagnostics(state, control)
+    assert diag.surface_temperature_k - celsius_to_kelvin(47.0) < 120.0
+    assert diag.flash_surface_temperature_k is not None
+    assert diag.flash_surface_temperature_k - diag.surface_temperature_k < 80.0

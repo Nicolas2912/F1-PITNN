@@ -170,6 +170,33 @@ class ThermalFieldSolver2D:
         source[patch_index] += patch_extra_density * zone_weights[None, None, :]
         return np.array(source, copy=True)
 
+    def source_distribution_volume_m3(
+        self,
+        *,
+        zone_weights: np.ndarray | None = None,
+        layer_source_weights: dict[str, float] | None = None,
+        wear: float = 0.0,
+        grain_index_w: np.ndarray | None = None,
+        blister_index_w: np.ndarray | None = None,
+        age_index: float = 0.0,
+    ) -> float:
+        """Return the effective source volume represented by a unit-density source field."""
+        layer_slices = self._native_thermal_material_inputs(
+            wear=wear,
+            grain_index_w=grain_index_w,
+            blister_index_w=blister_index_w,
+            age_index=age_index,
+        )["layer_slices"]
+        return float(
+            self._source_power_w_compact(
+                volumetric_source_w_per_m3=1.0,
+                layer_slices=layer_slices,
+                zone_weights=zone_weights,
+                layer_source_weights=layer_source_weights,
+                extra_source_w_per_m3=None,
+            )
+        )
+
     def contact_patch_indices(
         self,
         *,
@@ -719,86 +746,52 @@ class ThermalFieldSolver2D:
         dt_s: float,
     ) -> tuple[np.ndarray, int]:
         rhs = field + dt_s * source_w_per_m3 / np.maximum(rho_cp, 1e-12)
-        alpha_r = k_r / np.maximum(rho_cp, 1e-12)
-        alpha_theta = k_theta / np.maximum(rho_cp, 1e-12)
-        alpha_w = k_w / np.maximum(rho_cp, 1e-12)
-        coeff_r_minus = dt_s * alpha_r * self._radial_coeff_minus[:, None, None]
-        coeff_r_plus = dt_s * alpha_r * self._radial_coeff_plus[:, None, None]
-        coeff_theta = dt_s * alpha_theta * self._theta_coeff[:, None, None]
-        coeff_w_minus = dt_s * alpha_w * self._width_coeff_minus[None, None, :]
-        coeff_w_plus = dt_s * alpha_w * self._width_coeff_plus[None, None, :]
-
-        diagonal = 1.0 + coeff_r_minus + coeff_r_plus + 2.0 * coeff_theta + coeff_w_minus + coeff_w_plus
-        estimate = self._scratch_estimate
-        np.copyto(estimate, rhs)
-        iterations = 0
-        updated = self._scratch_updated
-        theta_work = self._scratch_theta_prev
+        estimate = np.array(rhs, copy=True)
         radial_cells, theta_cells, width_zones = estimate.shape
+        iterations = 0
+        # Preserve constant fields across mesh resolutions. The prior directional
+        # line-solve variant amplified uniform states at high resolution.
         for iterations in range(1, max(self.parameters.diffusion_max_iterations, 1) + 1):
             previous = np.array(estimate, copy=True)
+            max_delta = 0.0
+            for r in range(radial_cells):
+                for t in range(theta_cells):
+                    t_minus = (t - 1) % theta_cells
+                    t_plus = (t + 1) % theta_cells
+                    for w in range(width_zones):
+                        alpha_r = k_r[r, t, w] / max(rho_cp[r, t, w], 1e-12)
+                        alpha_theta = k_theta[r, t, w] / max(rho_cp[r, t, w], 1e-12)
+                        alpha_w = k_w[r, t, w] / max(rho_cp[r, t, w], 1e-12)
 
-            for theta_idx in range(theta_cells):
-                theta_prev_idx = (theta_idx - 1) % theta_cells
-                theta_next_idx = (theta_idx + 1) % theta_cells
-                for width_idx in range(width_zones):
-                    line_rhs = (
-                        rhs[:, theta_idx, width_idx]
-                        + coeff_theta[:, theta_idx, width_idx]
-                        * (previous[:, theta_prev_idx, width_idx] + previous[:, theta_next_idx, width_idx])
-                    )
-                    if width_idx > 0:
-                        line_rhs = line_rhs + coeff_w_minus[:, theta_idx, width_idx] * previous[:, theta_idx, width_idx - 1]
-                    if width_idx + 1 < width_zones:
-                        line_rhs = line_rhs + coeff_w_plus[:, theta_idx, width_idx] * previous[:, theta_idx, width_idx + 1]
-                    updated[:, theta_idx, width_idx] = self._solve_tridiagonal_line_python(
-                        lower=-coeff_r_minus[1:, theta_idx, width_idx],
-                        diagonal=diagonal[:, theta_idx, width_idx] - 2.0 * coeff_theta[:, theta_idx, width_idx] - coeff_w_minus[:, theta_idx, width_idx] - coeff_w_plus[:, theta_idx, width_idx],
-                        upper=-coeff_r_plus[:-1, theta_idx, width_idx],
-                        rhs=line_rhs,
-                    )
+                        coeff_r_minus = alpha_r * self._radial_coeff_minus[r]
+                        coeff_r_plus = alpha_r * self._radial_coeff_plus[r]
+                        coeff_theta = alpha_theta * self._theta_coeff[r]
+                        coeff_w_minus = alpha_w * self._width_coeff_minus[w]
+                        coeff_w_plus = alpha_w * self._width_coeff_plus[w]
 
-            for radial_idx in range(radial_cells):
-                for width_idx in range(width_zones):
-                    line_rhs = rhs[radial_idx, :, width_idx]
-                    if radial_idx > 0:
-                        line_rhs = line_rhs + coeff_r_minus[radial_idx, :, width_idx] * updated[radial_idx - 1, :, width_idx]
-                    if radial_idx + 1 < radial_cells:
-                        line_rhs = line_rhs + coeff_r_plus[radial_idx, :, width_idx] * updated[radial_idx + 1, :, width_idx]
-                    if width_idx > 0:
-                        line_rhs = line_rhs + coeff_w_minus[radial_idx, :, width_idx] * updated[radial_idx, :, width_idx - 1]
-                    if width_idx + 1 < width_zones:
-                        line_rhs = line_rhs + coeff_w_plus[radial_idx, :, width_idx] * updated[radial_idx, :, width_idx + 1]
-                    theta_work[radial_idx, :, width_idx] = self._solve_cyclic_tridiagonal_line_python(
-                        lower=-coeff_theta[radial_idx, 1:, width_idx],
-                        diagonal=diagonal[radial_idx, :, width_idx] - coeff_r_minus[radial_idx, :, width_idx] - coeff_r_plus[radial_idx, :, width_idx] - coeff_w_minus[radial_idx, :, width_idx] - coeff_w_plus[radial_idx, :, width_idx],
-                        upper=-coeff_theta[radial_idx, :-1, width_idx],
-                        alpha=-coeff_theta[radial_idx, 0, width_idx],
-                        beta=-coeff_theta[radial_idx, -1, width_idx],
-                        rhs=line_rhs,
-                    )
+                        neighbor_sum = 0.0
+                        diagonal = 1.0
+                        if r > 0:
+                            neighbor_sum += coeff_r_minus * estimate[r - 1, t, w]
+                            diagonal += dt_s * coeff_r_minus
+                        if r < radial_cells - 1:
+                            neighbor_sum += coeff_r_plus * estimate[r + 1, t, w]
+                            diagonal += dt_s * coeff_r_plus
 
-            for radial_idx in range(radial_cells):
-                theta_prev = np.roll(theta_work[radial_idx, :, :], shift=1, axis=0)
-                theta_next = np.roll(theta_work[radial_idx, :, :], shift=-1, axis=0)
-                for theta_idx in range(theta_cells):
-                    line_rhs = (
-                        rhs[radial_idx, theta_idx, :]
-                        + coeff_theta[radial_idx, theta_idx, :] * (theta_prev[theta_idx, :] + theta_next[theta_idx, :])
-                    )
-                    if radial_idx > 0:
-                        line_rhs = line_rhs + coeff_r_minus[radial_idx, theta_idx, :] * theta_work[radial_idx - 1, theta_idx, :]
-                    if radial_idx + 1 < radial_cells:
-                        line_rhs = line_rhs + coeff_r_plus[radial_idx, theta_idx, :] * theta_work[radial_idx + 1, theta_idx, :]
-                    updated[radial_idx, theta_idx, :] = self._solve_tridiagonal_line_python(
-                        lower=-coeff_w_minus[radial_idx, theta_idx, 1:],
-                        diagonal=diagonal[radial_idx, theta_idx, :] - coeff_r_minus[radial_idx, theta_idx, :] - coeff_r_plus[radial_idx, theta_idx, :] - 2.0 * coeff_theta[radial_idx, theta_idx, :],
-                        upper=-coeff_w_plus[radial_idx, theta_idx, :-1],
-                        rhs=line_rhs,
-                    )
+                        neighbor_sum += coeff_theta * estimate[r, t_minus, w]
+                        neighbor_sum += coeff_theta * estimate[r, t_plus, w]
+                        diagonal += 2.0 * dt_s * coeff_theta
 
-            max_delta = float(np.max(np.abs(updated - previous)))
-            estimate, updated = updated, estimate
+                        if w > 0:
+                            neighbor_sum += coeff_w_minus * estimate[r, t, w - 1]
+                            diagonal += dt_s * coeff_w_minus
+                        if w < width_zones - 1:
+                            neighbor_sum += coeff_w_plus * estimate[r, t, w + 1]
+                            diagonal += dt_s * coeff_w_plus
+
+                        updated = (rhs[r, t, w] + dt_s * neighbor_sum) / max(diagonal, 1e-12)
+                        max_delta = max(max_delta, abs(updated - estimate[r, t, w]))
+                        estimate[r, t, w] = updated
             if max_delta < self.parameters.diffusion_tolerance_k:
                 break
         return np.array(estimate, copy=True), iterations

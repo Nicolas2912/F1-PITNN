@@ -588,6 +588,16 @@ class HighFidelityTireSimulator:
         q_hyst_effective_w_per_m3 = q_hyst_w_per_m3 * (
             hysteresis_active_volume_m3 / max(self.parameters.hysteresis_active_volume_m3, 1e-9)
         )
+        hysteresis_total_w = q_hyst_effective_w_per_m3 * hysteresis_active_volume_m3
+        source_distribution_volume_m3 = self._thermal_solver.source_distribution_volume_m3(
+            zone_weights=zone_weights,
+            layer_source_weights=hysteresis.power_density_by_layer_w_per_m3,
+            wear=state.wear,
+            grain_index_w=current_grain,
+            blister_index_w=current_blister,
+            age_index=state.age_index,
+        )
+        q_hyst_source_w_per_m3 = hysteresis_total_w / max(source_distribution_volume_m3, 1e-12)
         boundary_source = self._boundary_source_field_w_per_m3(
             thermal_field_rtw_k=thermal_field_rtw,
             zone_friction_to_tire_w=zone_friction_to_tire_w,
@@ -603,7 +613,7 @@ class HighFidelityTireSimulator:
             inputs=effective_inputs,
             time_s=state.time_s,
             dt_s=dt_s,
-            volumetric_source_w_per_m3=q_hyst_effective_w_per_m3,
+            volumetric_source_w_per_m3=q_hyst_source_w_per_m3,
             extra_source_w_per_m3=boundary_source,
             layer_source_weights=hysteresis.power_density_by_layer_w_per_m3,
             wear=state.wear,
