@@ -13,6 +13,11 @@ import time
 import numpy as np
 from tqdm import tqdm
 
+try:
+    from sklearn.ensemble import ExtraTreesRegressor
+except ImportError:  # pragma: no cover - optional runtime dependency
+    ExtraTreesRegressor = None
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -29,6 +34,68 @@ OUTPUT_DIR = ROOT / "reports" / "results"
 RESULTS_FILE = OUTPUT_DIR / "high_fidelity_no_data_results.json"
 SUMMARY_FILE = OUTPUT_DIR / "high_fidelity_no_data_summary.md"
 _WORKER_PROGRESS_QUEUE = None
+
+
+@dataclass(frozen=True)
+class UQSurrogateConfig:
+    enabled: bool = False
+    kind: str = "extra_trees"
+    sobol_train_samples: int | None = None
+    sobol_validation_samples: int | None = None
+    ridge_alpha: float = 1e-6
+    max_rmse_c: float = 0.75
+    max_abs_error_c: float = 2.0
+    min_prediction_samples: int = 32
+    extra_trees_estimators: int = 600
+
+
+class QuadraticRidgeSurrogate:
+    def __init__(self, *, lower: np.ndarray, upper: np.ndarray, ridge_alpha: float) -> None:
+        self._lower = np.asarray(lower, dtype=float)
+        self._upper = np.asarray(upper, dtype=float)
+        self._ridge_alpha = float(ridge_alpha)
+        self._weights: np.ndarray | None = None
+
+    def _normalize(self, x: np.ndarray) -> np.ndarray:
+        scale = np.maximum(self._upper - self._lower, 1e-12)
+        return 2.0 * (np.asarray(x, dtype=float) - self._lower) / scale - 1.0
+
+    def _features(self, x: np.ndarray) -> np.ndarray:
+        x_norm = self._normalize(x)
+        return np.hstack([np.ones((x_norm.shape[0], 1), dtype=float), x_norm, x_norm * x_norm])
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> None:
+        features = self._features(x)
+        ridge = np.sqrt(self._ridge_alpha) * np.eye(features.shape[1], dtype=float)
+        augmented_features = np.vstack([features, ridge])
+        target_matrix = np.asarray(y, dtype=float)
+        augmented_targets = np.vstack([target_matrix, np.zeros((features.shape[1], target_matrix.shape[1]), dtype=float)])
+        self._weights, *_ = np.linalg.lstsq(augmented_features, augmented_targets, rcond=None)
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        if self._weights is None:
+            msg = "Surrogate must be fit before predict"
+            raise RuntimeError(msg)
+        return self._features(x) @ self._weights
+
+
+class ExtraTreesSurrogate:
+    def __init__(self, *, estimators: int, random_state: int) -> None:
+        if ExtraTreesRegressor is None:
+            msg = "scikit-learn is required for the extra_trees surrogate"
+            raise RuntimeError(msg)
+        self._model = ExtraTreesRegressor(
+            n_estimators=max(int(estimators), 100),
+            random_state=int(random_state),
+            n_jobs=-1,
+            min_samples_leaf=1,
+        )
+
+    def fit(self, x: np.ndarray, y: np.ndarray) -> None:
+        self._model.fit(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        return np.asarray(self._model.predict(np.asarray(x, dtype=float)), dtype=float)
 
 
 @dataclass(frozen=True)
@@ -638,6 +705,143 @@ def _batched_uq_tasks(
     ]
 
 
+def _sample_matrix(
+    *,
+    payloads: list[tuple[int, dict[str, float]]],
+    prior_names: tuple[str, ...],
+) -> np.ndarray:
+    return np.asarray(
+        [[float(sample[name]) for name in prior_names] for _idx, sample in payloads],
+        dtype=float,
+    )
+
+
+def _fit_multi_output_surrogate(
+    *,
+    kind: str,
+    priors,
+    train_payloads: list[tuple[int, dict[str, float]]],
+    target_matrix: np.ndarray,
+    ridge_alpha: float,
+    random_state: int,
+    extra_trees_estimators: int,
+):
+    x_train = _sample_matrix(payloads=train_payloads, prior_names=tuple(prior.name for prior in priors))
+    if kind == "extra_trees":
+        surrogate = ExtraTreesSurrogate(
+            estimators=extra_trees_estimators,
+            random_state=random_state,
+        )
+        surrogate.fit(x_train, target_matrix)
+        return surrogate
+    surrogate = QuadraticRidgeSurrogate(
+        lower=np.asarray([float(prior.lower) for prior in priors], dtype=float),
+        upper=np.asarray([float(prior.upper) for prior in priors], dtype=float),
+        ridge_alpha=ridge_alpha,
+    )
+    surrogate.fit(x_train, target_matrix)
+    return surrogate
+
+
+def _evaluate_sobol_payloads(
+    *,
+    eval_payloads: list[tuple[int, dict[str, float]]],
+    scenario: ScenarioConfig,
+    scenario_inputs: VehicleInputs,
+    tire_parameters: HighFidelityTireModelParameters,
+    vehicle_parameters: VehicleParameters,
+    dt_s: float,
+    diagnostics_stride: int,
+    workers: int,
+    progress_tracker: ProgressTracker | None,
+    pool_runner: ProcessPoolRunner | None,
+) -> list[tuple[int, dict[str, float]]]:
+    sobol_results: list[tuple[int, dict[str, float]]] = []
+    if workers > 1 and len(eval_payloads) > 1:
+        progress_queue, drainer = _parallel_progress_context(
+            progress_tracker=progress_tracker,
+            pool_runner=pool_runner,
+        )
+        try:
+            global _WORKER_PROGRESS_QUEUE
+            _WORKER_PROGRESS_QUEUE = progress_queue
+            tasks = _batched_uq_tasks(
+                items=eval_payloads,
+                workers=workers,
+                base_task={
+                    "scenario": scenario,
+                    "scenario_inputs": scenario_inputs,
+                    "tire_parameters": tire_parameters,
+                    "vehicle_parameters": vehicle_parameters,
+                    "dt_s": dt_s,
+                    "diagnostics_stride": diagnostics_stride,
+                },
+            )
+            if drainer is not None and hasattr(pool_runner, "restart"):
+                pool_runner.restart()
+            for batch_result in _iter_parallel_map(
+                worker_fn=_evaluate_sobol_batch,
+                tasks=tasks,
+                workers=workers,
+                pool_runner=pool_runner,
+            ):
+                sobol_results.extend(batch_result)
+                if drainer is None and progress_tracker is not None:
+                    progress_tracker.advance(len(batch_result))
+        finally:
+            _WORKER_PROGRESS_QUEUE = None
+            if drainer is not None:
+                drainer.stop()
+            if progress_queue is not None:
+                progress_queue.close()
+                progress_queue.join_thread()
+    else:
+        sobol_results = _evaluate_sobol_batch(
+            {
+                "batch": eval_payloads,
+                "scenario": scenario,
+                "scenario_inputs": scenario_inputs,
+                "tire_parameters": tire_parameters,
+                "vehicle_parameters": vehicle_parameters,
+                "dt_s": dt_s,
+                "diagnostics_stride": diagnostics_stride,
+            }
+        )
+        if progress_tracker is not None:
+            progress_tracker.advance(len(sobol_results))
+    sobol_results.sort(key=lambda item: item[0])
+    return sobol_results
+
+
+def _sobol_surrogate_splits(
+    *,
+    eval_payloads: list[tuple[int, dict[str, float]]],
+    train_count: int,
+    validation_count: int,
+    seed: int,
+) -> tuple[list[tuple[int, dict[str, float]]], list[tuple[int, dict[str, float]]], list[tuple[int, dict[str, float]]]]:
+    rng = np.random.default_rng(seed)
+    order = np.arange(len(eval_payloads), dtype=int)
+    rng.shuffle(order)
+    train_idx = np.sort(order[:train_count])
+    validation_idx = np.sort(order[train_count : train_count + validation_count])
+    predicted_idx = np.sort(order[train_count + validation_count :])
+    return (
+        [eval_payloads[int(idx)] for idx in train_idx],
+        [eval_payloads[int(idx)] for idx in validation_idx],
+        [eval_payloads[int(idx)] for idx in predicted_idx],
+    )
+
+
+def _sobol_surrogate_error_summary(
+    *,
+    predicted: np.ndarray,
+    exact: np.ndarray,
+) -> tuple[float, float]:
+    delta = np.asarray(predicted, dtype=float) - np.asarray(exact, dtype=float)
+    return float(np.sqrt(np.mean(delta * delta))), float(np.max(np.abs(delta)))
+
+
 def _should_enable_progress(enabled: bool | None) -> bool:
     if enabled is not None:
         return enabled
@@ -687,6 +891,7 @@ def run_high_fidelity_no_data(
     progress: bool | None = None,
     tire_parameters: HighFidelityTireModelParameters | None = None,
     vehicle_parameters: VehicleParameters | None = None,
+    uq_surrogate: UQSurrogateConfig | None = None,
 ) -> dict:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -701,6 +906,7 @@ def run_high_fidelity_no_data(
         internal_solver_dt_s=active_preset.internal_solver_dt_s,
     )
     vehicle_params = vehicle_parameters if vehicle_parameters is not None else VehicleParameters()
+    surrogate_config = uq_surrogate if uq_surrogate is not None else UQSurrogateConfig()
     scenarios = default_scenarios(duration_scale=duration_scale)
     progress_tracker = _build_progress_tracker(
         scenarios=scenarios,
@@ -749,6 +955,7 @@ def run_high_fidelity_no_data(
             workers=workers,
             progress_tracker=progress_tracker,
             pool_runner=pool_runner,
+            surrogate_config=surrogate_config,
         )
     finally:
         if pool_runner is not None:
@@ -774,6 +981,7 @@ def run_high_fidelity_no_data(
             "default_output_mode": "bands_plus_baseline",
             "scenario_names": [scenario.name for scenario in scenarios],
             "uq_scenario_names": [scenario.name for scenario in scenarios if scenario.include_in_uq],
+            "uq_surrogate": asdict(surrogate_config),
         },
         "timing": timing_summary,
         "priors": [asdict(prior) for prior in priors],
@@ -1149,6 +1357,7 @@ def run_sobol_uq(
     workers: int = 1,
     progress_tracker: ProgressTracker | None = None,
     pool_runner: ProcessPoolRunner | None = None,
+    surrogate_config: UQSurrogateConfig | None = None,
 ) -> dict:
     metric_candidates = (
         "peak_mean_surface_temp_c",
@@ -1181,60 +1390,134 @@ def run_sobol_uq(
             ))
 
     sobol_results: list[tuple[int, dict[str, float]]] = []
+    active_surrogate = surrogate_config if surrogate_config is not None else UQSurrogateConfig()
     if progress_tracker is not None:
         progress_tracker.set_phase("sobol")
-    if workers > 1 and len(eval_payloads) > 1:
-        progress_queue, drainer = _parallel_progress_context(
+    if active_surrogate.enabled and len(eval_payloads) > 0:
+        requested_train = active_surrogate.sobol_train_samples
+        train_count = min(
+            max(requested_train if requested_train is not None else max(4 * len(priors), 128), 1),
+            len(eval_payloads),
+        )
+        validation_count = min(
+            max(
+                active_surrogate.sobol_validation_samples
+                if active_surrogate.sobol_validation_samples is not None
+                else max(len(priors), 32),
+                0,
+            ),
+            max(len(eval_payloads) - train_count, 0),
+        )
+        predicted_count = len(eval_payloads) - train_count - validation_count
+        if (
+            predicted_count >= max(int(active_surrogate.min_prediction_samples), 1)
+            and active_surrogate.kind in {"quadratic_ridge", "extra_trees"}
+        ):
+            train_payloads, validation_payloads, predicted_payloads = _sobol_surrogate_splits(
+                eval_payloads=eval_payloads,
+                train_count=train_count,
+                validation_count=validation_count,
+                seed=seed + 303,
+            )
+            exact_payloads = train_payloads + validation_payloads
+            sobol_results = _evaluate_sobol_payloads(
+                eval_payloads=exact_payloads,
+                scenario=scenario,
+                scenario_inputs=scenario_inputs,
+                tire_parameters=tire_parameters,
+                vehicle_parameters=vehicle_parameters,
+                dt_s=dt_s,
+                diagnostics_stride=diagnostics_stride,
+                workers=workers,
+                progress_tracker=None,
+                pool_runner=pool_runner,
+            )
+            result_by_eval_idx = {eval_idx: values for eval_idx, values in sobol_results}
+            surrogate = _fit_multi_output_surrogate(
+                kind=active_surrogate.kind,
+                priors=priors,
+                train_payloads=train_payloads,
+                target_matrix=np.asarray(
+                    [
+                        [float(result_by_eval_idx[eval_idx][metric_name]) for metric_name in metric_candidates]
+                        for eval_idx, _sample in train_payloads
+                    ],
+                    dtype=float,
+                ),
+                ridge_alpha=active_surrogate.ridge_alpha,
+                random_state=seed + 404,
+                extra_trees_estimators=active_surrogate.extra_trees_estimators,
+            )
+            prior_names = tuple(prior.name for prior in priors)
+            if validation_payloads:
+                validation_pred = surrogate.predict(
+                    _sample_matrix(payloads=validation_payloads, prior_names=prior_names)
+                )
+                validation_exact = np.asarray(
+                    [
+                        [float(result_by_eval_idx[eval_idx][metric_name]) for metric_name in metric_candidates]
+                        for eval_idx, _sample in validation_payloads
+                    ],
+                    dtype=float,
+                )
+                rmse_c, max_abs_error_c = _sobol_surrogate_error_summary(
+                    predicted=validation_pred,
+                    exact=validation_exact,
+                )
+            else:
+                rmse_c, max_abs_error_c = 0.0, 0.0
+            if np.isfinite(rmse_c) and np.isfinite(max_abs_error_c):
+                if predicted_payloads:
+                    prediction_matrix = surrogate.predict(
+                        _sample_matrix(payloads=predicted_payloads, prior_names=prior_names)
+                    )
+                    for row_idx, (eval_idx, _sample) in enumerate(predicted_payloads):
+                        result_by_eval_idx[eval_idx] = {
+                            metric_name: float(prediction_matrix[row_idx, metric_idx])
+                            for metric_idx, metric_name in enumerate(metric_candidates)
+                        }
+                if progress_tracker is not None:
+                    progress_tracker.advance(len(eval_payloads))
+                sobol_results = sorted(result_by_eval_idx.items(), key=lambda item: item[0])
+            else:
+                sobol_results = _evaluate_sobol_payloads(
+                    eval_payloads=eval_payloads,
+                    scenario=scenario,
+                    scenario_inputs=scenario_inputs,
+                    tire_parameters=tire_parameters,
+                    vehicle_parameters=vehicle_parameters,
+                    dt_s=dt_s,
+                    diagnostics_stride=diagnostics_stride,
+                    workers=workers,
+                    progress_tracker=progress_tracker,
+                    pool_runner=pool_runner,
+                )
+        else:
+            sobol_results = _evaluate_sobol_payloads(
+                eval_payloads=eval_payloads,
+                scenario=scenario,
+                scenario_inputs=scenario_inputs,
+                tire_parameters=tire_parameters,
+                vehicle_parameters=vehicle_parameters,
+                dt_s=dt_s,
+                diagnostics_stride=diagnostics_stride,
+                workers=workers,
+                progress_tracker=progress_tracker,
+                pool_runner=pool_runner,
+            )
+    else:
+        sobol_results = _evaluate_sobol_payloads(
+            eval_payloads=eval_payloads,
+            scenario=scenario,
+            scenario_inputs=scenario_inputs,
+            tire_parameters=tire_parameters,
+            vehicle_parameters=vehicle_parameters,
+            dt_s=dt_s,
+            diagnostics_stride=diagnostics_stride,
+            workers=workers,
             progress_tracker=progress_tracker,
             pool_runner=pool_runner,
         )
-        try:
-            global _WORKER_PROGRESS_QUEUE
-            _WORKER_PROGRESS_QUEUE = progress_queue
-            tasks = _batched_uq_tasks(
-                items=eval_payloads,
-                workers=workers,
-                base_task={
-                    "scenario": scenario,
-                    "scenario_inputs": scenario_inputs,
-                    "tire_parameters": tire_parameters,
-                    "vehicle_parameters": vehicle_parameters,
-                    "dt_s": dt_s,
-                    "diagnostics_stride": diagnostics_stride,
-                },
-            )
-            if drainer is not None and hasattr(pool_runner, "restart"):
-                pool_runner.restart()
-            for batch_result in _iter_parallel_map(
-                worker_fn=_evaluate_sobol_batch,
-                tasks=tasks,
-                workers=workers,
-                pool_runner=pool_runner,
-            ):
-                sobol_results.extend(batch_result)
-                if drainer is None and progress_tracker is not None:
-                    progress_tracker.advance(len(batch_result))
-        finally:
-            _WORKER_PROGRESS_QUEUE = None
-            if drainer is not None:
-                drainer.stop()
-            if progress_queue is not None:
-                progress_queue.close()
-                progress_queue.join_thread()
-    else:
-        sobol_results = _evaluate_sobol_batch(
-            {
-                "batch": eval_payloads,
-                "scenario": scenario,
-                "scenario_inputs": scenario_inputs,
-                "tire_parameters": tire_parameters,
-                "vehicle_parameters": vehicle_parameters,
-                "dt_s": dt_s,
-                "diagnostics_stride": diagnostics_stride,
-            }
-        )
-        if progress_tracker is not None:
-            progress_tracker.advance(len(sobol_results))
 
     ordered_metrics = {
         metric_name: np.zeros(len(eval_payloads), dtype=float)
@@ -1373,6 +1656,14 @@ def main() -> None:
     parser.add_argument("--internal-dt-s", type=float, default=None)
     parser.add_argument("--diagnostics-stride", type=int, default=None)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--uq-surrogate", choices=["none", "quadratic_ridge", "extra_trees"], default="none")
+    parser.add_argument("--uq-surrogate-sobol-train-samples", type=int, default=None)
+    parser.add_argument("--uq-surrogate-sobol-validation-samples", type=int, default=None)
+    parser.add_argument("--uq-surrogate-ridge-alpha", type=float, default=1e-6)
+    parser.add_argument("--uq-surrogate-max-rmse-c", type=float, default=0.75)
+    parser.add_argument("--uq-surrogate-max-abs-error-c", type=float, default=2.0)
+    parser.add_argument("--uq-surrogate-min-prediction-samples", type=int, default=32)
+    parser.add_argument("--uq-surrogate-extra-trees-estimators", type=int, default=600)
     parser.add_argument("--progress", action="store_true", default=None)
     parser.add_argument("--no-progress", dest="progress", action="store_false")
     args = parser.parse_args()
@@ -1382,6 +1673,17 @@ def main() -> None:
         radial_cells=preset.radial_cells if args.radial_cells is None else args.radial_cells,
         theta_cells=preset.theta_cells if args.theta_cells is None else args.theta_cells,
         internal_solver_dt_s=preset.internal_solver_dt_s if args.internal_dt_s is None else args.internal_dt_s,
+    )
+    surrogate_config = UQSurrogateConfig(
+        enabled=args.uq_surrogate != "none",
+        kind=args.uq_surrogate,
+        sobol_train_samples=args.uq_surrogate_sobol_train_samples,
+        sobol_validation_samples=args.uq_surrogate_sobol_validation_samples,
+        ridge_alpha=float(args.uq_surrogate_ridge_alpha),
+        max_rmse_c=float(args.uq_surrogate_max_rmse_c),
+        max_abs_error_c=float(args.uq_surrogate_max_abs_error_c),
+        min_prediction_samples=int(args.uq_surrogate_min_prediction_samples),
+        extra_trees_estimators=int(args.uq_surrogate_extra_trees_estimators),
     )
     run_high_fidelity_no_data(
         preset=args.preset,
@@ -1396,6 +1698,7 @@ def main() -> None:
         workers=max(int(args.workers), 1),
         progress=args.progress,
         tire_parameters=tire_parameters,
+        uq_surrogate=surrogate_config,
     )
 
 

@@ -174,6 +174,83 @@ def test_p8_end_to_end_parallel_workers_match_serial_outputs(tmp_path: Path) -> 
     assert _normalized_summary(serial_rerendered) == _normalized_summary(parallel_rerendered)
 
 
+def test_p8_sobol_surrogate_keeps_baseline_artifact_identical(tmp_path: Path) -> None:
+    _root, run_module, _report_module = _load_modules()
+    exact_results_path = tmp_path / "hf_exact.json"
+    exact_summary_path = tmp_path / "hf_exact.md"
+    surrogate_results_path = tmp_path / "hf_surrogate.json"
+    surrogate_summary_path = tmp_path / "hf_surrogate.md"
+
+    run_module.run_high_fidelity_no_data(
+        preset="smoke",
+        output_path=exact_results_path,
+        summary_path=exact_summary_path,
+        seed=77,
+        dt_s=0.2,
+        duration_scale=0.05,
+        lhs_samples=2,
+        sobol_samples=2,
+        workers=1,
+        progress=False,
+    )
+    run_module.run_high_fidelity_no_data(
+        preset="smoke",
+        output_path=surrogate_results_path,
+        summary_path=surrogate_summary_path,
+        seed=77,
+        dt_s=0.2,
+        duration_scale=0.05,
+        lhs_samples=2,
+        sobol_samples=2,
+        workers=1,
+        progress=False,
+        uq_surrogate=run_module.UQSurrogateConfig(enabled=True, sobol_train_samples=2, sobol_validation_samples=0),
+    )
+
+    exact_payload = json.loads(exact_results_path.read_text(encoding="utf-8"))
+    surrogate_payload = json.loads(surrogate_results_path.read_text(encoding="utf-8"))
+    assert exact_payload["baseline"] == surrogate_payload["baseline"]
+    assert surrogate_payload["metadata"]["uq_surrogate"]["enabled"] is True
+
+
+def test_p8_sobol_surrogate_reduces_exact_eval_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    _root, run_module, _report_module = _load_modules()
+    scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    exact_eval_counts: list[int] = []
+    original = run_module._evaluate_sobol_payloads
+
+    def counted(*args, **kwargs):
+        exact_eval_counts.append(len(kwargs["eval_payloads"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run_module, "_evaluate_sobol_payloads", counted)
+
+    result = run_module.run_sobol_uq(
+        scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        sobol_samples=3,
+        seed=77,
+        diagnostics_stride=1,
+        workers=1,
+        progress_tracker=None,
+        surrogate_config=run_module.UQSurrogateConfig(
+            enabled=True,
+            sobol_train_samples=6,
+            sobol_validation_samples=3,
+            min_prediction_samples=1,
+            max_rmse_c=1e9,
+            max_abs_error_c=1e9,
+        ),
+    )
+
+    assert exact_eval_counts == [9]
+    assert result["objective_metric"].endswith(".peak_mean_surface_temp_c")
+
+
 def test_p8_lhs_progress_advances_per_sample_in_serial_mode() -> None:
     _root, run_module, _report_module = _load_modules()
     progress_tracker = _RecordingProgressTracker()

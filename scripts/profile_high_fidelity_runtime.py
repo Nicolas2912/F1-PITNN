@@ -17,6 +17,7 @@ from models.vehicle_thermal import VehicleParameters  # noqa: E402
 from run_high_fidelity_no_data import (  # noqa: E402
     ProcessPoolRunner,
     ScenarioConfig,
+    UQSurrogateConfig,
     _vehicle_inputs_for_scenario,
     _vehicle_simulator,
     default_scenarios,
@@ -199,6 +200,14 @@ def main() -> None:
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--run-full-lhs", action="store_true")
     parser.add_argument("--run-full-sobol", action="store_true")
+    parser.add_argument("--uq-surrogate", choices=["none", "quadratic_ridge", "extra_trees"], default="none")
+    parser.add_argument("--uq-surrogate-sobol-train-samples", type=int, default=None)
+    parser.add_argument("--uq-surrogate-sobol-validation-samples", type=int, default=None)
+    parser.add_argument("--uq-surrogate-ridge-alpha", type=float, default=1e-6)
+    parser.add_argument("--uq-surrogate-max-rmse-c", type=float, default=0.75)
+    parser.add_argument("--uq-surrogate-max-abs-error-c", type=float, default=2.0)
+    parser.add_argument("--uq-surrogate-min-prediction-samples", type=int, default=32)
+    parser.add_argument("--uq-surrogate-extra-trees-estimators", type=int, default=600)
     args = parser.parse_args()
 
     preset = fidelity_preset(args.preset)
@@ -233,6 +242,17 @@ def main() -> None:
     priors = uq.default_tire_priors(parameters=tire_parameters)
     sobol_eval_count = sobol_samples * (2 + len(priors))
     pilot_sobol_eval_count = pilot_sobol_samples * (2 + len(priors))
+    surrogate_config = UQSurrogateConfig(
+        enabled=args.uq_surrogate != "none",
+        kind=args.uq_surrogate,
+        sobol_train_samples=args.uq_surrogate_sobol_train_samples,
+        sobol_validation_samples=args.uq_surrogate_sobol_validation_samples,
+        ridge_alpha=float(args.uq_surrogate_ridge_alpha),
+        max_rmse_c=float(args.uq_surrogate_max_rmse_c),
+        max_abs_error_c=float(args.uq_surrogate_max_abs_error_c),
+        min_prediction_samples=int(args.uq_surrogate_min_prediction_samples),
+        extra_trees_estimators=int(args.uq_surrogate_extra_trees_estimators),
+    )
 
     overall_start = time.perf_counter()
     pool_runner = ProcessPoolRunner(workers=args.workers) if args.workers > 1 else None
@@ -280,6 +300,7 @@ def main() -> None:
                 diagnostics_stride=diagnostics_stride,
                 workers=args.workers,
                 pool_runner=pool_runner,
+                surrogate_config=surrogate_config,
             ),
         )
     finally:
@@ -337,6 +358,7 @@ def main() -> None:
             "prior_count": len(priors),
             "sobol_eval_count_full": int(sobol_eval_count),
             "sobol_eval_count_measured": int(pilot_sobol_eval_count),
+            "uq_surrogate": asdict(surrogate_config),
         },
         "native_runtime": {
             "native_diffusion_available": native_diffusion_available(),
