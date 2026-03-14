@@ -9,6 +9,7 @@ import numpy as np
 from .native_diffusion import (
     native_diffusion_available,
     native_diffusion_enabled,
+    native_diffusion_solver_mode,
     native_multi_substep_available,
     run_native_build_source_and_diffuse_implicit,
     run_native_diffuse_vectorized_implicit,
@@ -376,6 +377,7 @@ class ThermalFieldSolver2D:
         diffusion_time_s = 0.0
         diffusion_iterations = 0
         if use_native_diffusion and native_multi_substep_available():
+            native_solver_mode = native_diffusion_solver_mode()
             native_materials = self._native_thermal_material_inputs(
                 wear=wear,
                 grain_index_w=grain_index_w,
@@ -429,6 +431,7 @@ class ThermalFieldSolver2D:
                     minimum_temperature_k=minimum_temperature_k,
                     maximum_temperature_k=maximum_temperature_k,
                     enable_profiling=bool(self.parameters.enable_profiling),
+                    solver_mode=native_solver_mode,
                 )
             )
             expected_energy_j = self._total_energy_j_compact(field=np.array(base_field, dtype=float, copy=False), rho_cp_r=native_materials["rho_cp_r"])

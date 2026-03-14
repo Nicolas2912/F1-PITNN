@@ -23,6 +23,12 @@ using IntArray3D = py::array_t<long long, py::array::c_style | py::array::forcec
 using IntArray1D = py::array_t<long long, py::array::c_style | py::array::forcecast>;
 using IntArray2D = py::array_t<long long, py::array::c_style | py::array::forcecast>;
 
+enum class DiffusionSolverMode {
+    Legacy = 0,
+    Adi = 1,
+    Auto = 2,
+};
+
 struct LineWorkspace {
     std::vector<double> lower;
     std::vector<double> diagonal;
@@ -254,6 +260,16 @@ DiffusionWorkspace& diffusion_workspace() {
 CompactPropertyWorkspace& compact_property_workspace() {
     thread_local CompactPropertyWorkspace workspace;
     return workspace;
+}
+
+DiffusionSolverMode parse_solver_mode(const std::string& solver_mode) {
+    if (solver_mode == "adi") {
+        return DiffusionSolverMode::Adi;
+    }
+    if (solver_mode == "auto") {
+        return DiffusionSolverMode::Auto;
+    }
+    return DiffusionSolverMode::Legacy;
 }
 
 void advect_theta_periodic_core(
@@ -1094,7 +1110,8 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core_comp
     ssize_t theta_cells,
     ssize_t width_zones,
     int diffusion_max_iterations,
-    double diffusion_tolerance_k
+    double diffusion_tolerance_k,
+    DiffusionSolverMode solver_mode = DiffusionSolverMode::Legacy
 ) {
     const ssize_t item_count = radial_cells * theta_cells * width_zones;
     auto index = make_index(theta_cells, width_zones);
@@ -1156,8 +1173,12 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core_comp
         }
     }
 
+    const int max_iterations =
+        solver_mode == DiffusionSolverMode::Adi
+        ? 1
+        : std::max(diffusion_max_iterations, 1);
     int iterations = 0;
-    for (iterations = 1; iterations <= std::max(diffusion_max_iterations, 1); ++iterations) {
+    for (iterations = 1; iterations <= max_iterations; ++iterations) {
         const double* previous = estimate->data();
 
         auto solve_radial_line = [&](LineWorkspace& line_workspace, ssize_t t, ssize_t w) {
@@ -1362,7 +1383,7 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core_comp
         }
 
         std::swap(estimate, updated);
-        if (max_delta < diffusion_tolerance_k) {
+        if (max_delta < diffusion_tolerance_k || solver_mode == DiffusionSolverMode::Adi) {
             break;
         }
     }
@@ -1691,7 +1712,8 @@ std::tuple<py::array_t<double>, int, double, double, double, double, double> the
     py::object layer_source_weights,
     double minimum_temperature_k,
     double maximum_temperature_k,
-    bool enable_profiling
+    bool enable_profiling,
+    const std::string& solver_mode
 ) {
     auto field_info = field.request();
     auto cell_volumes_info = cell_volumes_m3.request();
@@ -1762,6 +1784,7 @@ std::tuple<py::array_t<double>, int, double, double, double, double, double> the
     }
 
     const double dt_sub = dt_s / std::max(substeps, 1);
+    const DiffusionSolverMode parsed_solver_mode = parse_solver_mode(solver_mode);
     const ssize_t item_count = radial_cell_count * theta_cell_count * width_zone_count;
     auto& source_build_workspace = source_workspace();
     auto& workspace = diffusion_workspace();
@@ -1891,7 +1914,8 @@ std::tuple<py::array_t<double>, int, double, double, double, double, double> the
                     theta_cell_count,
                     width_zone_count,
                     diffusion_max_iterations,
-                    diffusion_tolerance_k
+                    diffusion_tolerance_k,
+                    parsed_solver_mode
                 );
             }
             total_diffusion_time_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -1914,7 +1938,8 @@ std::tuple<py::array_t<double>, int, double, double, double, double, double> the
                 theta_cell_count,
                 width_zone_count,
                 diffusion_max_iterations,
-                diffusion_tolerance_k
+                diffusion_tolerance_k,
+                parsed_solver_mode
             );
         }
 

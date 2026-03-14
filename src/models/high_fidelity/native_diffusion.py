@@ -32,6 +32,13 @@ def native_diffusion_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def native_diffusion_solver_mode() -> str:
+    value = os.getenv("PITNN_NATIVE_DIFFUSION_SOLVER", "legacy").strip().lower()
+    if value in {"legacy", "adi", "auto"}:
+        return value
+    return "legacy"
+
+
 def _ensure_float_array(value: np.ndarray) -> np.ndarray:
     if isinstance(value, np.ndarray) and value.dtype == float:
         return value
@@ -228,6 +235,7 @@ def run_native_thermal_step_multi_substep(
     minimum_temperature_k: float,
     maximum_temperature_k: float,
     enable_profiling: bool,
+    solver_mode: str = "legacy",
 ) -> tuple[np.ndarray, int, float, float, float, float, float]:
     if _native_thermal_step_multi_substep is None:
         msg = "Native multi-substep thermal extension is not available"
@@ -278,6 +286,7 @@ def run_native_thermal_step_multi_substep(
         minimum_temperature_k,
         maximum_temperature_k,
         enable_profiling,
+        solver_mode,
     )
     return (
         _ensure_float_array(result_field),

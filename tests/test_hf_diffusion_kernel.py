@@ -63,6 +63,12 @@ def _layer_source_weights_array() -> np.ndarray:
     return np.asarray([12_000.0, 8_500.0, 7_200.0, 5_600.0, 4_300.0], dtype=float)
 
 
+def _trace_rmse(lhs: list[float], rhs: list[float]) -> float:
+    lhs_array = np.asarray(lhs, dtype=float)
+    rhs_array = np.asarray(rhs, dtype=float)
+    return float(np.sqrt(np.mean((lhs_array - rhs_array) ** 2)))
+
+
 def _compressed_native_material_inputs(
     solver: ThermalFieldSolver2D,
     *,
@@ -443,6 +449,85 @@ def test_native_multi_substep_thermal_step_matches_python_reference_when_availab
     assert np.array_equal(native_field, python_field)
 
 
+def test_native_adi_multi_substep_matches_legacy_to_tight_tolerance_when_available() -> None:
+    if not native_diffusion_available() or not native_multi_substep_available():
+        return
+
+    params = HighFidelityTireModelParameters(
+        radial_cells=8,
+        theta_cells=16,
+        width_zones=3,
+        diffusion_max_iterations=10,
+        diffusion_tolerance_k=1e-6,
+        internal_solver_dt_s=0.01,
+    )
+    solver = ThermalFieldSolver2D(params)
+    rng = np.random.default_rng(20260314)
+    field = rng.normal(loc=343.15, scale=7.5, size=(params.radial_cells, params.theta_cells, params.width_zones)).astype(float)
+    extra_source = rng.normal(loc=420.0, scale=35.0, size=field.shape).astype(float)
+    native_materials = _compressed_native_material_inputs(
+        solver,
+        wear=0.08,
+        grain_index_w=np.array([0.05, 0.02, 0.04], dtype=float),
+        blister_index_w=np.array([0.01, 0.03, 0.02], dtype=float),
+        age_index=0.15,
+    )
+    kwargs = dict(
+        field=np.array(field, dtype=float, copy=True),
+        extra_source_w_per_m3=np.array(extra_source, dtype=float, copy=True),
+        cell_volumes_m3=np.array(solver._cell_volumes_m3, dtype=float, copy=True),
+        dt_s=0.04,
+        substeps=4,
+        radial_coeff_minus=np.array(solver._radial_coeff_minus, dtype=float, copy=True),
+        radial_coeff_plus=np.array(solver._radial_coeff_plus, dtype=float, copy=True),
+        theta_coeff=np.array(solver._theta_coeff, dtype=float, copy=True),
+        width_coeff_minus=np.array(solver._width_coeff_minus, dtype=float, copy=True),
+        width_coeff_plus=np.array(solver._width_coeff_plus, dtype=float, copy=True),
+        diffusion_max_iterations=int(params.diffusion_max_iterations),
+        diffusion_tolerance_k=float(params.diffusion_tolerance_k),
+        source_volumetric_fraction=float(params.source_volumetric_fraction),
+        volumetric_source_w_per_m3=18_500.0,
+        wheel_angular_speed_radps=187.0,
+        time_s=0.31,
+        theta_delta_rad=solver._theta_delta_rad,
+        patch_radial_indices=solver._patch_radial_indices,
+        theta_offsets=solver._theta_offsets,
+        width_indices=solver._width_indices,
+        layer_slices=native_materials["layer_slices"],
+        volumetric_heat_capacity_by_layer=native_materials["volumetric_heat_capacity_by_layer"],
+        k_r_base_by_layer=native_materials["k_r_base_by_layer"],
+        k_theta_base_by_layer=native_materials["k_theta_base_by_layer"],
+        k_w_base_by_layer=native_materials["k_w_base_by_layer"],
+        shoulder_bias_by_layer=native_materials["shoulder_bias_by_layer"],
+        center_bias_by_layer=native_materials["center_bias_by_layer"],
+        bead_bias_by_layer=native_materials["bead_bias_by_layer"],
+        temp_sensitivity_by_layer=native_materials["temp_sensitivity_by_layer"],
+        wear_sensitivity_by_layer=native_materials["wear_sensitivity_by_layer"],
+        reinforcement_density_by_layer=native_materials["reinforcement_density_by_layer"],
+        cord_angle_deg_by_layer=native_materials["cord_angle_deg_by_layer"],
+        grain_index_w=native_materials["grain_index_w"],
+        blister_index_w=native_materials["blister_index_w"],
+        wear=native_materials["wear"],
+        age_index=native_materials["age_index"],
+        construction_enabled=native_materials["construction_enabled"],
+        construction_bead_width_fraction=native_materials["construction_bead_width_fraction"],
+        construction_temp_reference_k=native_materials["construction_temp_reference_k"],
+        tread_blister_conductivity_penalty=native_materials["tread_blister_conductivity_penalty"],
+        zone_weights=np.array([0.22, 0.51, 0.27], dtype=float),
+        layer_source_weights=_layer_source_weights_array(),
+        minimum_temperature_k=float(params.minimum_temperature_k),
+        maximum_temperature_k=float(params.maximum_temperature_k),
+        enable_profiling=False,
+    )
+
+    legacy_field, legacy_iterations, *_ = run_native_thermal_step_multi_substep(**kwargs, solver_mode="legacy")
+    adi_field, adi_iterations, *_ = run_native_thermal_step_multi_substep(**kwargs, solver_mode="adi")
+
+    assert adi_iterations <= legacy_iterations
+    assert np.max(np.abs(adi_field - legacy_field)) < 1e-5
+    assert np.mean(np.abs(adi_field - legacy_field)) < 1e-6
+
+
 def test_native_diffusion_dispatch_matches_python_for_single_scenario(monkeypatch) -> None:
     if not native_diffusion_available():
         return
@@ -483,6 +568,64 @@ def test_native_diffusion_dispatch_matches_python_for_single_scenario(monkeypatc
     )
 
     assert python_result == native_result
+
+
+def test_native_adi_dispatch_matches_legacy_to_tight_tolerance(monkeypatch) -> None:
+    if not native_diffusion_available() or not native_multi_substep_available():
+        return
+
+    run_module = _load_run_module()
+    scenario = run_module.ScenarioConfig(
+        name="adi_probe",
+        duration_s=0.8,
+        speed_mps=52.0,
+        ax_mps2=-0.8,
+        ay_mps2=4.6,
+        steering_angle_rad=0.05,
+        yaw_rate_radps=0.10,
+        brake_power_w=14_000.0,
+        drive_power_w=6_000.0,
+        ambient_temp_k=304.15,
+        track_temp_k=318.15,
+    )
+    tire_params = run_module.default_tire_parameters(radial_cells=8, theta_cells=16, internal_solver_dt_s=0.03)
+    vehicle_params = run_module.VehicleParameters()
+
+    monkeypatch.setenv("PITNN_USE_NATIVE_DIFFUSION", "1")
+    monkeypatch.setenv("PITNN_NATIVE_DIFFUSION_SOLVER", "legacy")
+    legacy_result = run_module.run_single_scenario(
+        scenario=scenario,
+        tire_parameters=tire_params,
+        vehicle_parameters=vehicle_params,
+        dt_s=0.2,
+        diagnostics_stride=2,
+    )
+
+    monkeypatch.setenv("PITNN_NATIVE_DIFFUSION_SOLVER", "adi")
+    adi_result = run_module.run_single_scenario(
+        scenario=scenario,
+        tire_parameters=tire_params,
+        vehicle_parameters=vehicle_params,
+        dt_s=0.2,
+        diagnostics_stride=2,
+    )
+
+    for metric in (
+        "peak_mean_surface_temp_c",
+        "end_mean_surface_temp_c",
+        "peak_mean_core_temp_c",
+        "end_mean_core_temp_c",
+    ):
+        assert adi_result["summary"][metric] == pytest.approx(legacy_result["summary"][metric], rel=0.0, abs=1e-8)
+
+    assert _trace_rmse(
+        adi_result["trace"]["mean_surface_temp_c"],
+        legacy_result["trace"]["mean_surface_temp_c"],
+    ) < 1e-8
+    assert _trace_rmse(
+        adi_result["trace"]["mean_core_temp_c"],
+        legacy_result["trace"]["mean_core_temp_c"],
+    ) < 1e-8
 
 
 def test_native_diffusion_dispatch_matches_python_for_reduced_harness(tmp_path: Path, monkeypatch) -> None:
