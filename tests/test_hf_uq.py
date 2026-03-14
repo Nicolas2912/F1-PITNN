@@ -71,6 +71,8 @@ def test_p7_sobol_ranking_identifies_dominant_parameter() -> None:
     assert result.indices[0].name == "x1"
     assert result.indices[0].total_order > result.indices[1].total_order
     assert result.indices[1].total_order > result.indices[2].total_order
+    assert result.indices[0].first_order > 0.9
+    assert sum(index.first_order for index in result.indices) <= 1.05
     for index in result.indices:
         assert 0.0 <= index.first_order <= 1.0
         assert 0.0 <= index.total_order <= 1.0

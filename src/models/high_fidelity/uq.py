@@ -251,7 +251,9 @@ class HighFidelityUQ:
         indices: list[SobolSensitivityIndex] = []
         for dim, prior in enumerate(priors):
             y_ab = y_ab_by_dim[dim]
-            first_order_raw = float(np.mean(y_b * (y_ab - y_a)) / variance)
+            # Jansen's first-order estimator is materially more stable than the
+            # covariance form for the small-variance thermal objectives used here.
+            first_order_raw = float(1.0 - np.mean((y_b - y_ab) ** 2) / (2.0 * variance))
             total_order_raw = float(np.mean((y_a - y_ab) ** 2) / (2.0 * variance))
             first_order = float(np.clip(first_order_raw, 0.0, 1.0))
             total_order = float(np.clip(max(total_order_raw, first_order), 0.0, 1.0))

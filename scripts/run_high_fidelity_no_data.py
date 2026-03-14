@@ -1466,7 +1466,12 @@ def run_sobol_uq(
                 )
             else:
                 rmse_c, max_abs_error_c = 0.0, 0.0
-            if np.isfinite(rmse_c) and np.isfinite(max_abs_error_c):
+            if (
+                np.isfinite(rmse_c)
+                and np.isfinite(max_abs_error_c)
+                and rmse_c <= float(active_surrogate.max_rmse_c)
+                and max_abs_error_c <= float(active_surrogate.max_abs_error_c)
+            ):
                 if predicted_payloads:
                     prediction_matrix = surrogate.predict(
                         _sample_matrix(payloads=predicted_payloads, prior_names=prior_names)

@@ -251,6 +251,50 @@ def test_p8_sobol_surrogate_reduces_exact_eval_count(monkeypatch: pytest.MonkeyP
     assert result["objective_metric"].endswith(".peak_mean_surface_temp_c")
 
 
+def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, run_module, _report_module = _load_modules()
+    scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    eval_counts: list[int] = []
+    original = run_module._evaluate_sobol_payloads
+
+    def counted(*args, **kwargs):
+        eval_counts.append(len(kwargs["eval_payloads"]))
+        return original(*args, **kwargs)
+
+    class _BadSurrogate:
+        def predict(self, x):
+            return 500.0 * __import__("numpy").ones((x.shape[0], 4), dtype=float)
+
+    monkeypatch.setattr(run_module, "_evaluate_sobol_payloads", counted)
+    monkeypatch.setattr(run_module, "_fit_multi_output_surrogate", lambda **kwargs: _BadSurrogate())
+
+    run_module.run_sobol_uq(
+        scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        sobol_samples=3,
+        seed=77,
+        diagnostics_stride=1,
+        workers=1,
+        progress_tracker=None,
+        surrogate_config=run_module.UQSurrogateConfig(
+            enabled=True,
+            sobol_train_samples=6,
+            sobol_validation_samples=3,
+            min_prediction_samples=1,
+            max_rmse_c=0.01,
+            max_abs_error_c=0.01,
+        ),
+    )
+
+    assert eval_counts == [9, 75]
+
+
 def test_p8_lhs_progress_advances_per_sample_in_serial_mode() -> None:
     _root, run_module, _report_module = _load_modules()
     progress_tracker = _RecordingProgressTracker()
