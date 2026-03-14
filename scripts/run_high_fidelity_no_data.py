@@ -1420,7 +1420,7 @@ def run_sobol_uq(
                 seed=seed + 303,
             )
             exact_payloads = train_payloads + validation_payloads
-            sobol_results = _evaluate_sobol_payloads(
+            exact_results = _evaluate_sobol_payloads(
                 eval_payloads=exact_payloads,
                 scenario=scenario,
                 scenario_inputs=scenario_inputs,
@@ -1429,10 +1429,10 @@ def run_sobol_uq(
                 dt_s=dt_s,
                 diagnostics_stride=diagnostics_stride,
                 workers=workers,
-                progress_tracker=None,
+                progress_tracker=progress_tracker,
                 pool_runner=pool_runner,
             )
-            result_by_eval_idx = {eval_idx: values for eval_idx, values in sobol_results}
+            result_by_eval_idx = {eval_idx: values for eval_idx, values in exact_results}
             surrogate = _fit_multi_output_surrogate(
                 kind=active_surrogate.kind,
                 priors=priors,
@@ -1482,11 +1482,11 @@ def run_sobol_uq(
                             for metric_idx, metric_name in enumerate(metric_candidates)
                         }
                 if progress_tracker is not None:
-                    progress_tracker.advance(len(eval_payloads))
+                    progress_tracker.advance(len(predicted_payloads))
                 sobol_results = sorted(result_by_eval_idx.items(), key=lambda item: item[0])
             else:
-                sobol_results = _evaluate_sobol_payloads(
-                    eval_payloads=eval_payloads,
+                predicted_results = _evaluate_sobol_payloads(
+                    eval_payloads=predicted_payloads,
                     scenario=scenario,
                     scenario_inputs=scenario_inputs,
                     tire_parameters=tire_parameters,
@@ -1497,6 +1497,8 @@ def run_sobol_uq(
                     progress_tracker=progress_tracker,
                     pool_runner=pool_runner,
                 )
+                result_by_eval_idx.update({eval_idx: values for eval_idx, values in predicted_results})
+                sobol_results = sorted(result_by_eval_idx.items(), key=lambda item: item[0])
         else:
             sobol_results = _evaluate_sobol_payloads(
                 eval_payloads=eval_payloads,

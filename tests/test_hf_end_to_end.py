@@ -257,6 +257,19 @@ def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(
     _root, run_module, _report_module = _load_modules()
     scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
     tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    baseline_result = run_module.run_sobol_uq(
+        scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        sobol_samples=3,
+        seed=77,
+        diagnostics_stride=1,
+        workers=1,
+        progress_tracker=None,
+        surrogate_config=run_module.UQSurrogateConfig(enabled=False),
+    )
     eval_counts: list[int] = []
     original = run_module._evaluate_sobol_payloads
 
@@ -271,7 +284,7 @@ def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(
     monkeypatch.setattr(run_module, "_evaluate_sobol_payloads", counted)
     monkeypatch.setattr(run_module, "_fit_multi_output_surrogate", lambda **kwargs: _BadSurrogate())
 
-    run_module.run_sobol_uq(
+    fallback_result = run_module.run_sobol_uq(
         scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
         tire_parameters=tire_parameters,
         vehicle_parameters=run_module.VehicleParameters(),
@@ -292,7 +305,8 @@ def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(
         ),
     )
 
-    assert eval_counts == [9, 75]
+    assert eval_counts == [9, 66]
+    assert fallback_result == baseline_result
 
 
 def test_p8_lhs_progress_advances_per_sample_in_serial_mode() -> None:
