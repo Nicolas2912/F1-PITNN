@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
@@ -664,6 +665,69 @@ def test_native_diffusion_dispatch_matches_python_for_reduced_harness(tmp_path: 
 
     assert _normalized_artifact(python_json) == _normalized_artifact(native_json)
     assert _normalized_summary(python_md) == _normalized_summary(native_md)
+
+
+def test_native_diffusion_dispatch_matches_python_for_full_surface_regression(monkeypatch) -> None:
+    if not native_diffusion_available():
+        return
+
+    run_module = _load_run_module()
+    scenario = replace(
+        next(s for s in run_module.default_scenarios() if s.name == "steady_corner"),
+        duration_s=0.2,
+    )
+    tire_params = run_module.default_tire_parameters(
+        radial_cells=24,
+        theta_cells=72,
+        internal_solver_dt_s=0.01,
+    )
+    vehicle_params = run_module.VehicleParameters()
+
+    monkeypatch.delenv("PITNN_USE_NATIVE_DIFFUSION", raising=False)
+    python_result = run_module.run_single_scenario(
+        scenario=scenario,
+        tire_parameters=tire_params,
+        vehicle_parameters=vehicle_params,
+        dt_s=0.2,
+        diagnostics_stride=1,
+    )
+
+    monkeypatch.setenv("PITNN_USE_NATIVE_DIFFUSION", "1")
+    monkeypatch.setenv("PITNN_NATIVE_DIFFUSION_SOLVER", "adi")
+    monkeypatch.setenv("PITNN_USE_NATIVE_SIMULATOR_KERNELS", "1")
+    native_result = run_module.run_single_scenario(
+        scenario=scenario,
+        tire_parameters=tire_params,
+        vehicle_parameters=vehicle_params,
+        dt_s=0.2,
+        diagnostics_stride=1,
+    )
+
+    for metric in (
+        "peak_mean_surface_temp_c",
+        "end_mean_surface_temp_c",
+        "peak_mean_core_temp_c",
+        "end_mean_core_temp_c",
+        "max_energy_residual_pct",
+    ):
+        assert native_result["summary"][metric] == pytest.approx(
+            python_result["summary"][metric],
+            rel=0.0,
+            abs=1e-4,
+        )
+    assert native_result["summary"]["coupling_convergence_rate"] == python_result["summary"]["coupling_convergence_rate"]
+    assert native_result["summary"]["all_outputs_finite"] == python_result["summary"]["all_outputs_finite"]
+    assert native_result["trace"]["mean_surface_temp_c"] == pytest.approx(
+        python_result["trace"]["mean_surface_temp_c"],
+        rel=0.0,
+        abs=1e-4,
+    )
+    assert native_result["trace"]["mean_core_temp_c"] == pytest.approx(
+        python_result["trace"]["mean_core_temp_c"],
+        rel=0.0,
+        abs=1e-4,
+    )
+    assert native_result["summary"]["peak_mean_surface_temp_c"] < 100.0
 
 
 @pytest.mark.parametrize("workers", [1, 2, 4, 8])

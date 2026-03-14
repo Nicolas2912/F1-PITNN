@@ -820,67 +820,14 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core(
     auto& workspace = diffusion_workspace();
     workspace.ensure_size(item_count, std::max({radial_cells, theta_cells, width_zones}));
     auto& rhs = workspace.rhs;
-    auto& coeff_r_minus = workspace.coeff_r_minus;
-    auto& coeff_r_plus = workspace.coeff_r_plus;
-    auto& coeff_theta = workspace.coeff_theta;
-    auto& coeff_w_minus = workspace.coeff_w_minus;
-    auto& coeff_w_plus = workspace.coeff_w_plus;
-    auto& diagonal = workspace.diagonal;
-    auto& radial_diagonal = workspace.radial_diagonal;
-    auto& theta_diagonal = workspace.theta_diagonal;
-    auto& width_diagonal = workspace.width_diagonal;
-    auto& neg_coeff_r_minus = workspace.neg_coeff_r_minus;
-    auto& neg_coeff_r_plus = workspace.neg_coeff_r_plus;
-    auto& neg_coeff_theta = workspace.neg_coeff_theta;
-    auto& neg_coeff_w_minus = workspace.neg_coeff_w_minus;
-    auto& neg_coeff_w_plus = workspace.neg_coeff_w_plus;
     auto* estimate = &workspace.estimate;
-    auto* updated = &workspace.updated;
-    auto& radial_sweep = workspace.radial_sweep;
-    auto& theta_sweep = workspace.theta_sweep;
 
     for (ssize_t r = 0; r < radial_cells; ++r) {
         for (ssize_t t = 0; t < theta_cells; ++t) {
             for (ssize_t w = 0; w < width_zones; ++w) {
                 const ssize_t idx = index(r, t, w);
                 const double rho_safe = std::max(rho_cp_ptr[idx], 1e-12);
-                const double alpha_r = k_r_ptr[idx] / rho_safe;
-                const double alpha_theta = k_theta_ptr[idx] / rho_safe;
-                const double alpha_w = k_w_ptr[idx] / rho_safe;
                 rhs[static_cast<size_t>(idx)] = field_ptr[idx] + dt_s * source_ptr[idx] / rho_safe;
-                coeff_r_minus[static_cast<size_t>(idx)] = dt_s * alpha_r * radial_minus_ptr[r];
-                coeff_r_plus[static_cast<size_t>(idx)] = dt_s * alpha_r * radial_plus_ptr[r];
-                coeff_theta[static_cast<size_t>(idx)] = dt_s * alpha_theta * theta_coeff_ptr[r];
-                coeff_w_minus[static_cast<size_t>(idx)] = dt_s * alpha_w * width_minus_ptr[w];
-                coeff_w_plus[static_cast<size_t>(idx)] = dt_s * alpha_w * width_plus_ptr[w];
-                diagonal[static_cast<size_t>(idx)] =
-                    1.0
-                    + coeff_r_minus[static_cast<size_t>(idx)]
-                    + coeff_r_plus[static_cast<size_t>(idx)]
-                    + 2.0 * coeff_theta[static_cast<size_t>(idx)]
-                    + coeff_w_minus[static_cast<size_t>(idx)]
-                    + coeff_w_plus[static_cast<size_t>(idx)];
-                radial_diagonal[static_cast<size_t>(idx)] =
-                    diagonal[static_cast<size_t>(idx)]
-                    - 2.0 * coeff_theta[static_cast<size_t>(idx)]
-                    - coeff_w_minus[static_cast<size_t>(idx)]
-                    - coeff_w_plus[static_cast<size_t>(idx)];
-                theta_diagonal[static_cast<size_t>(idx)] =
-                    diagonal[static_cast<size_t>(idx)]
-                    - coeff_r_minus[static_cast<size_t>(idx)]
-                    - coeff_r_plus[static_cast<size_t>(idx)]
-                    - coeff_w_minus[static_cast<size_t>(idx)]
-                    - coeff_w_plus[static_cast<size_t>(idx)];
-                width_diagonal[static_cast<size_t>(idx)] =
-                    diagonal[static_cast<size_t>(idx)]
-                    - coeff_r_minus[static_cast<size_t>(idx)]
-                    - coeff_r_plus[static_cast<size_t>(idx)]
-                    - 2.0 * coeff_theta[static_cast<size_t>(idx)];
-                neg_coeff_r_minus[static_cast<size_t>(idx)] = -coeff_r_minus[static_cast<size_t>(idx)];
-                neg_coeff_r_plus[static_cast<size_t>(idx)] = -coeff_r_plus[static_cast<size_t>(idx)];
-                neg_coeff_theta[static_cast<size_t>(idx)] = -coeff_theta[static_cast<size_t>(idx)];
-                neg_coeff_w_minus[static_cast<size_t>(idx)] = -coeff_w_minus[static_cast<size_t>(idx)];
-                neg_coeff_w_plus[static_cast<size_t>(idx)] = -coeff_w_plus[static_cast<size_t>(idx)];
                 (*estimate)[static_cast<size_t>(idx)] = rhs[static_cast<size_t>(idx)];
             }
         }
@@ -888,204 +835,57 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core(
 
     int iterations = 0;
     for (iterations = 1; iterations <= std::max(diffusion_max_iterations, 1); ++iterations) {
-        const double* previous = estimate->data();
-
-        auto solve_radial_line = [&](LineWorkspace& line_workspace, ssize_t t, ssize_t w) {
-            const ssize_t theta_prev = (t - 1 + theta_cells) % theta_cells;
-            const ssize_t theta_next = (t + 1) % theta_cells;
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                const ssize_t idx = index(r, t, w);
-                line_workspace.diagonal[static_cast<size_t>(r)] = radial_diagonal[static_cast<size_t>(idx)];
-                if (r > 0) {
-                    line_workspace.lower[static_cast<size_t>(r - 1)] = neg_coeff_r_minus[static_cast<size_t>(idx)];
-                }
-                if (r + 1 < radial_cells) {
-                    line_workspace.upper[static_cast<size_t>(r)] = neg_coeff_r_plus[static_cast<size_t>(idx)];
-                }
-                double line_rhs =
-                    rhs[static_cast<size_t>(idx)]
-                    + coeff_theta[static_cast<size_t>(idx)]
-                        * (
-                            previous[static_cast<size_t>(index(r, theta_prev, w))]
-                            + previous[static_cast<size_t>(index(r, theta_next, w))]
-                        );
-                if (w > 0) {
-                    line_rhs += coeff_w_minus[static_cast<size_t>(idx)] * previous[static_cast<size_t>(index(r, t, w - 1))];
-                }
-                if (w + 1 < width_zones) {
-                    line_rhs += coeff_w_plus[static_cast<size_t>(idx)] * previous[static_cast<size_t>(index(r, t, w + 1))];
-                }
-                line_workspace.rhs[static_cast<size_t>(r)] = line_rhs;
-            }
-            solve_tridiagonal_in_place(line_workspace, radial_cells);
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                radial_sweep[static_cast<size_t>(index(r, t, w))] = line_workspace.rhs[static_cast<size_t>(r)];
-            }
-        };
-
-        auto solve_theta_line = [&](LineWorkspace& line_workspace, ssize_t r, ssize_t w) {
-            for (ssize_t t = 0; t < theta_cells; ++t) {
-                const ssize_t idx = index(r, t, w);
-                line_workspace.diagonal[static_cast<size_t>(t)] = theta_diagonal[static_cast<size_t>(idx)];
-                if (t > 0) {
-                    line_workspace.lower[static_cast<size_t>(t - 1)] = neg_coeff_theta[static_cast<size_t>(idx)];
-                }
-                if (t + 1 < theta_cells) {
-                    line_workspace.upper[static_cast<size_t>(t)] = neg_coeff_theta[static_cast<size_t>(idx)];
-                }
-                double line_rhs = rhs[static_cast<size_t>(idx)];
-                if (r > 0) {
-                    line_rhs += coeff_r_minus[static_cast<size_t>(idx)] * radial_sweep[static_cast<size_t>(index(r - 1, t, w))];
-                }
-                if (r + 1 < radial_cells) {
-                    line_rhs += coeff_r_plus[static_cast<size_t>(idx)] * radial_sweep[static_cast<size_t>(index(r + 1, t, w))];
-                }
-                if (w > 0) {
-                    line_rhs += coeff_w_minus[static_cast<size_t>(idx)] * radial_sweep[static_cast<size_t>(index(r, t, w - 1))];
-                }
-                if (w + 1 < width_zones) {
-                    line_rhs += coeff_w_plus[static_cast<size_t>(idx)] * radial_sweep[static_cast<size_t>(index(r, t, w + 1))];
-                }
-                line_workspace.rhs[static_cast<size_t>(t)] = line_rhs;
-            }
-            solve_cyclic_tridiagonal_in_place(
-                line_workspace,
-                theta_cells,
-                neg_coeff_theta[static_cast<size_t>(index(r, 0, w))],
-                neg_coeff_theta[static_cast<size_t>(index(r, theta_cells - 1, w))]
-            );
-            for (ssize_t t = 0; t < theta_cells; ++t) {
-                theta_sweep[static_cast<size_t>(index(r, t, w))] = line_workspace.rhs[static_cast<size_t>(t)];
-            }
-        };
-
         double max_delta = 0.0;
-        auto solve_width_line = [&](LineWorkspace& line_workspace, ssize_t r, ssize_t t) {
-            if (width_zones == 3) {
-                const ssize_t theta_prev = (t - 1 + theta_cells) % theta_cells;
-                const ssize_t theta_next = (t + 1) % theta_cells;
-                const ssize_t idx0 = index(r, t, 0);
-                const ssize_t idx1 = index(r, t, 1);
-                const ssize_t idx2 = index(r, t, 2);
-
-                double rhs0 =
-                    rhs[static_cast<size_t>(idx0)]
-                    + coeff_theta[static_cast<size_t>(idx0)]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, 0))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, 0))]
-                        );
-                double rhs1 =
-                    rhs[static_cast<size_t>(idx1)]
-                    + coeff_theta[static_cast<size_t>(idx1)]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, 1))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, 1))]
-                        );
-                double rhs2 =
-                    rhs[static_cast<size_t>(idx2)]
-                    + coeff_theta[static_cast<size_t>(idx2)]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, 2))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, 2))]
-                        );
-                if (r > 0) {
-                    rhs0 += coeff_r_minus[static_cast<size_t>(idx0)] * theta_sweep[static_cast<size_t>(index(r - 1, t, 0))];
-                    rhs1 += coeff_r_minus[static_cast<size_t>(idx1)] * theta_sweep[static_cast<size_t>(index(r - 1, t, 1))];
-                    rhs2 += coeff_r_minus[static_cast<size_t>(idx2)] * theta_sweep[static_cast<size_t>(index(r - 1, t, 2))];
-                }
-                if (r + 1 < radial_cells) {
-                    rhs0 += coeff_r_plus[static_cast<size_t>(idx0)] * theta_sweep[static_cast<size_t>(index(r + 1, t, 0))];
-                    rhs1 += coeff_r_plus[static_cast<size_t>(idx1)] * theta_sweep[static_cast<size_t>(index(r + 1, t, 1))];
-                    rhs2 += coeff_r_plus[static_cast<size_t>(idx2)] * theta_sweep[static_cast<size_t>(index(r + 1, t, 2))];
-                }
-
-                solve_tridiagonal_size3_in_place(
-                    neg_coeff_w_minus[static_cast<size_t>(idx1)],
-                    neg_coeff_w_minus[static_cast<size_t>(idx2)],
-                    width_diagonal[static_cast<size_t>(idx0)],
-                    width_diagonal[static_cast<size_t>(idx1)],
-                    width_diagonal[static_cast<size_t>(idx2)],
-                    neg_coeff_w_plus[static_cast<size_t>(idx0)],
-                    neg_coeff_w_plus[static_cast<size_t>(idx1)],
-                    rhs0,
-                    rhs1,
-                    rhs2
-                );
-
-                (*updated)[static_cast<size_t>(idx0)] = rhs0;
-                (*updated)[static_cast<size_t>(idx1)] = rhs1;
-                (*updated)[static_cast<size_t>(idx2)] = rhs2;
-                double local_max_delta = std::abs(rhs0 - previous[static_cast<size_t>(idx0)]);
-                local_max_delta = std::max(local_max_delta, std::abs(rhs1 - previous[static_cast<size_t>(idx1)]));
-                local_max_delta = std::max(local_max_delta, std::abs(rhs2 - previous[static_cast<size_t>(idx2)]));
-                return local_max_delta;
-            }
-
-            for (ssize_t w = 0; w < width_zones; ++w) {
-                const ssize_t idx = index(r, t, w);
-                line_workspace.diagonal[static_cast<size_t>(w)] = width_diagonal[static_cast<size_t>(idx)];
-                if (w > 0) {
-                    line_workspace.lower[static_cast<size_t>(w - 1)] = neg_coeff_w_minus[static_cast<size_t>(idx)];
-                }
-                if (w + 1 < width_zones) {
-                    line_workspace.upper[static_cast<size_t>(w)] = neg_coeff_w_plus[static_cast<size_t>(idx)];
-                }
-                const ssize_t theta_prev = (t - 1 + theta_cells) % theta_cells;
-                const ssize_t theta_next = (t + 1) % theta_cells;
-                double line_rhs =
-                    rhs[static_cast<size_t>(idx)]
-                    + coeff_theta[static_cast<size_t>(idx)]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, w))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, w))]
-                        );
-                if (r > 0) {
-                    line_rhs += coeff_r_minus[static_cast<size_t>(idx)] * theta_sweep[static_cast<size_t>(index(r - 1, t, w))];
-                }
-                if (r + 1 < radial_cells) {
-                    line_rhs += coeff_r_plus[static_cast<size_t>(idx)] * theta_sweep[static_cast<size_t>(index(r + 1, t, w))];
-                }
-                line_workspace.rhs[static_cast<size_t>(w)] = line_rhs;
-            }
-            solve_tridiagonal_in_place(line_workspace, width_zones);
-            double local_max_delta = 0.0;
-            for (ssize_t w = 0; w < width_zones; ++w) {
-                const ssize_t idx = index(r, t, w);
-                const double value = line_workspace.rhs[static_cast<size_t>(w)];
-                (*updated)[static_cast<size_t>(idx)] = value;
-                local_max_delta = std::max(
-                    local_max_delta,
-                    std::abs(value - previous[static_cast<size_t>(idx)])
-                );
-            }
-            return local_max_delta;
-        };
-
-        {
-            LineWorkspace radial_workspace(radial_cells);
+        for (ssize_t r = 0; r < radial_cells; ++r) {
             for (ssize_t t = 0; t < theta_cells; ++t) {
+                const ssize_t t_minus = (t - 1 + theta_cells) % theta_cells;
+                const ssize_t t_plus = (t + 1) % theta_cells;
                 for (ssize_t w = 0; w < width_zones; ++w) {
-                    solve_radial_line(radial_workspace, t, w);
-                }
-            }
+                    const ssize_t idx = index(r, t, w);
+                    const double rho_safe = std::max(rho_cp_ptr[idx], 1e-12);
+                    const double alpha_r = k_r_ptr[idx] / rho_safe;
+                    const double alpha_theta = k_theta_ptr[idx] / rho_safe;
+                    const double alpha_w = k_w_ptr[idx] / rho_safe;
 
-            LineWorkspace theta_workspace(theta_cells);
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                for (ssize_t w = 0; w < width_zones; ++w) {
-                    solve_theta_line(theta_workspace, r, w);
-                }
-            }
+                    const double coeff_r_minus = alpha_r * radial_minus_ptr[r];
+                    const double coeff_r_plus = alpha_r * radial_plus_ptr[r];
+                    const double coeff_theta = alpha_theta * theta_coeff_ptr[r];
+                    const double coeff_w_minus = alpha_w * width_minus_ptr[w];
+                    const double coeff_w_plus = alpha_w * width_plus_ptr[w];
 
-            LineWorkspace width_workspace(width_zones);
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                for (ssize_t t = 0; t < theta_cells; ++t) {
-                    max_delta = std::max(max_delta, solve_width_line(width_workspace, r, t));
+                    double neighbor_sum = 0.0;
+                    double diagonal = 1.0;
+                    if (r > 0) {
+                        neighbor_sum += coeff_r_minus * (*estimate)[static_cast<size_t>(index(r - 1, t, w))];
+                        diagonal += dt_s * coeff_r_minus;
+                    }
+                    if (r + 1 < radial_cells) {
+                        neighbor_sum += coeff_r_plus * (*estimate)[static_cast<size_t>(index(r + 1, t, w))];
+                        diagonal += dt_s * coeff_r_plus;
+                    }
+
+                    neighbor_sum += coeff_theta * (*estimate)[static_cast<size_t>(index(r, t_minus, w))];
+                    neighbor_sum += coeff_theta * (*estimate)[static_cast<size_t>(index(r, t_plus, w))];
+                    diagonal += 2.0 * dt_s * coeff_theta;
+
+                    if (w > 0) {
+                        neighbor_sum += coeff_w_minus * (*estimate)[static_cast<size_t>(index(r, t, w - 1))];
+                        diagonal += dt_s * coeff_w_minus;
+                    }
+                    if (w + 1 < width_zones) {
+                        neighbor_sum += coeff_w_plus * (*estimate)[static_cast<size_t>(index(r, t, w + 1))];
+                        diagonal += dt_s * coeff_w_plus;
+                    }
+
+                    const double prior = (*estimate)[static_cast<size_t>(idx)];
+                    const double next =
+                        (rhs[static_cast<size_t>(idx)] + dt_s * neighbor_sum) / std::max(diagonal, 1e-12);
+                    (*estimate)[static_cast<size_t>(idx)] = next;
+                    max_delta = std::max(max_delta, std::abs(next - prior));
                 }
             }
         }
 
-        std::swap(estimate, updated);
         if (max_delta < diffusion_tolerance_k) {
             break;
         }
@@ -1120,9 +920,6 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core_comp
     auto& compact_workspace = compact_property_workspace();
     auto& rhs = workspace.rhs;
     auto* estimate = &workspace.estimate;
-    auto* updated = &workspace.updated;
-    auto& radial_sweep = workspace.radial_sweep;
-    auto& theta_sweep = workspace.theta_sweep;
 
     for (ssize_t r = 0; r < radial_cells; ++r) {
         const double rho_safe = std::max(rho_cp_r[static_cast<size_t>(r)], 1e-12);
@@ -1131,34 +928,11 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core_comp
             const double alpha_r = k_r_rw[rw_idx] / rho_safe;
             const double alpha_theta = k_theta_rw[rw_idx] / rho_safe;
             const double alpha_w = k_w_rw[rw_idx] / rho_safe;
-            compact_workspace.coeff_r_minus_rw[rw_idx] = dt_s * alpha_r * radial_minus_ptr[r];
-            compact_workspace.coeff_r_plus_rw[rw_idx] = dt_s * alpha_r * radial_plus_ptr[r];
-            compact_workspace.coeff_theta_rw[rw_idx] = dt_s * alpha_theta * theta_coeff_ptr[r];
-            compact_workspace.coeff_w_minus_rw[rw_idx] = dt_s * alpha_w * width_minus_ptr[w];
-            compact_workspace.coeff_w_plus_rw[rw_idx] = dt_s * alpha_w * width_plus_ptr[w];
-            const double diagonal =
-                1.0
-                + compact_workspace.coeff_r_minus_rw[rw_idx]
-                + compact_workspace.coeff_r_plus_rw[rw_idx]
-                + 2.0 * compact_workspace.coeff_theta_rw[rw_idx]
-                + compact_workspace.coeff_w_minus_rw[rw_idx]
-                + compact_workspace.coeff_w_plus_rw[rw_idx];
-            compact_workspace.radial_diagonal_rw[rw_idx] =
-                diagonal
-                - 2.0 * compact_workspace.coeff_theta_rw[rw_idx]
-                - compact_workspace.coeff_w_minus_rw[rw_idx]
-                - compact_workspace.coeff_w_plus_rw[rw_idx];
-            compact_workspace.theta_diagonal_rw[rw_idx] =
-                diagonal
-                - compact_workspace.coeff_r_minus_rw[rw_idx]
-                - compact_workspace.coeff_r_plus_rw[rw_idx]
-                - compact_workspace.coeff_w_minus_rw[rw_idx]
-                - compact_workspace.coeff_w_plus_rw[rw_idx];
-            compact_workspace.width_diagonal_rw[rw_idx] =
-                diagonal
-                - compact_workspace.coeff_r_minus_rw[rw_idx]
-                - compact_workspace.coeff_r_plus_rw[rw_idx]
-                - 2.0 * compact_workspace.coeff_theta_rw[rw_idx];
+            compact_workspace.coeff_r_minus_rw[rw_idx] = alpha_r * radial_minus_ptr[r];
+            compact_workspace.coeff_r_plus_rw[rw_idx] = alpha_r * radial_plus_ptr[r];
+            compact_workspace.coeff_theta_rw[rw_idx] = alpha_theta * theta_coeff_ptr[r];
+            compact_workspace.coeff_w_minus_rw[rw_idx] = alpha_w * width_minus_ptr[w];
+            compact_workspace.coeff_w_plus_rw[rw_idx] = alpha_w * width_plus_ptr[w];
         }
     }
 
@@ -1179,210 +953,54 @@ std::pair<const std::vector<double>*, int> diffuse_vectorized_implicit_core_comp
         : std::max(diffusion_max_iterations, 1);
     int iterations = 0;
     for (iterations = 1; iterations <= max_iterations; ++iterations) {
-        const double* previous = estimate->data();
-
-        auto solve_radial_line = [&](LineWorkspace& line_workspace, ssize_t t, ssize_t w) {
-            const ssize_t theta_prev = (t - 1 + theta_cells) % theta_cells;
-            const ssize_t theta_next = (t + 1) % theta_cells;
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                const ssize_t idx = index(r, t, w);
-                const size_t rw_idx = static_cast<size_t>(r * width_zones + w);
-                line_workspace.diagonal[static_cast<size_t>(r)] = compact_workspace.radial_diagonal_rw[rw_idx];
-                if (r > 0) {
-                    line_workspace.lower[static_cast<size_t>(r - 1)] = -compact_workspace.coeff_r_minus_rw[rw_idx];
-                }
-                if (r + 1 < radial_cells) {
-                    line_workspace.upper[static_cast<size_t>(r)] = -compact_workspace.coeff_r_plus_rw[rw_idx];
-                }
-                double line_rhs =
-                    rhs[static_cast<size_t>(idx)]
-                    + compact_workspace.coeff_theta_rw[rw_idx]
-                        * (
-                            previous[static_cast<size_t>(index(r, theta_prev, w))]
-                            + previous[static_cast<size_t>(index(r, theta_next, w))]
-                        );
-                if (w > 0) {
-                    line_rhs += compact_workspace.coeff_w_minus_rw[rw_idx] * previous[static_cast<size_t>(index(r, t, w - 1))];
-                }
-                if (w + 1 < width_zones) {
-                    line_rhs += compact_workspace.coeff_w_plus_rw[rw_idx] * previous[static_cast<size_t>(index(r, t, w + 1))];
-                }
-                line_workspace.rhs[static_cast<size_t>(r)] = line_rhs;
-            }
-            solve_tridiagonal_in_place(line_workspace, radial_cells);
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                radial_sweep[static_cast<size_t>(index(r, t, w))] = line_workspace.rhs[static_cast<size_t>(r)];
-            }
-        };
-
-        auto solve_theta_line = [&](LineWorkspace& line_workspace, ssize_t r, ssize_t w) {
-            const size_t rw_idx = static_cast<size_t>(r * width_zones + w);
-            for (ssize_t t = 0; t < theta_cells; ++t) {
-                const ssize_t idx = index(r, t, w);
-                line_workspace.diagonal[static_cast<size_t>(t)] = compact_workspace.theta_diagonal_rw[rw_idx];
-                if (t > 0) {
-                    line_workspace.lower[static_cast<size_t>(t - 1)] = -compact_workspace.coeff_theta_rw[rw_idx];
-                }
-                if (t + 1 < theta_cells) {
-                    line_workspace.upper[static_cast<size_t>(t)] = -compact_workspace.coeff_theta_rw[rw_idx];
-                }
-                double line_rhs = rhs[static_cast<size_t>(idx)];
-                if (r > 0) {
-                    line_rhs += compact_workspace.coeff_r_minus_rw[rw_idx] * radial_sweep[static_cast<size_t>(index(r - 1, t, w))];
-                }
-                if (r + 1 < radial_cells) {
-                    line_rhs += compact_workspace.coeff_r_plus_rw[rw_idx] * radial_sweep[static_cast<size_t>(index(r + 1, t, w))];
-                }
-                if (w > 0) {
-                    line_rhs += compact_workspace.coeff_w_minus_rw[rw_idx] * radial_sweep[static_cast<size_t>(index(r, t, w - 1))];
-                }
-                if (w + 1 < width_zones) {
-                    line_rhs += compact_workspace.coeff_w_plus_rw[rw_idx] * radial_sweep[static_cast<size_t>(index(r, t, w + 1))];
-                }
-                line_workspace.rhs[static_cast<size_t>(t)] = line_rhs;
-            }
-            solve_cyclic_tridiagonal_in_place(
-                line_workspace,
-                theta_cells,
-                -compact_workspace.coeff_theta_rw[rw_idx],
-                -compact_workspace.coeff_theta_rw[rw_idx]
-            );
-            for (ssize_t t = 0; t < theta_cells; ++t) {
-                theta_sweep[static_cast<size_t>(index(r, t, w))] = line_workspace.rhs[static_cast<size_t>(t)];
-            }
-        };
-
         double max_delta = 0.0;
-        auto solve_width_line = [&](LineWorkspace& line_workspace, ssize_t r, ssize_t t) {
-            if (width_zones == 3) {
-                const ssize_t theta_prev = (t - 1 + theta_cells) % theta_cells;
-                const ssize_t theta_next = (t + 1) % theta_cells;
-                const ssize_t idx0 = index(r, t, 0);
-                const ssize_t idx1 = index(r, t, 1);
-                const ssize_t idx2 = index(r, t, 2);
-                const size_t rw_idx0 = static_cast<size_t>(r * width_zones);
-                const size_t rw_idx1 = rw_idx0 + 1;
-                const size_t rw_idx2 = rw_idx0 + 2;
-
-                double rhs0 =
-                    rhs[static_cast<size_t>(idx0)]
-                    + compact_workspace.coeff_theta_rw[rw_idx0]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, 0))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, 0))]
-                        );
-                double rhs1 =
-                    rhs[static_cast<size_t>(idx1)]
-                    + compact_workspace.coeff_theta_rw[rw_idx1]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, 1))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, 1))]
-                        );
-                double rhs2 =
-                    rhs[static_cast<size_t>(idx2)]
-                    + compact_workspace.coeff_theta_rw[rw_idx2]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, 2))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, 2))]
-                        );
-                if (r > 0) {
-                    rhs0 += compact_workspace.coeff_r_minus_rw[rw_idx0] * theta_sweep[static_cast<size_t>(index(r - 1, t, 0))];
-                    rhs1 += compact_workspace.coeff_r_minus_rw[rw_idx1] * theta_sweep[static_cast<size_t>(index(r - 1, t, 1))];
-                    rhs2 += compact_workspace.coeff_r_minus_rw[rw_idx2] * theta_sweep[static_cast<size_t>(index(r - 1, t, 2))];
-                }
-                if (r + 1 < radial_cells) {
-                    rhs0 += compact_workspace.coeff_r_plus_rw[rw_idx0] * theta_sweep[static_cast<size_t>(index(r + 1, t, 0))];
-                    rhs1 += compact_workspace.coeff_r_plus_rw[rw_idx1] * theta_sweep[static_cast<size_t>(index(r + 1, t, 1))];
-                    rhs2 += compact_workspace.coeff_r_plus_rw[rw_idx2] * theta_sweep[static_cast<size_t>(index(r + 1, t, 2))];
-                }
-
-                solve_tridiagonal_size3_in_place(
-                    -compact_workspace.coeff_w_minus_rw[rw_idx1],
-                    -compact_workspace.coeff_w_minus_rw[rw_idx2],
-                    compact_workspace.width_diagonal_rw[rw_idx0],
-                    compact_workspace.width_diagonal_rw[rw_idx1],
-                    compact_workspace.width_diagonal_rw[rw_idx2],
-                    -compact_workspace.coeff_w_plus_rw[rw_idx0],
-                    -compact_workspace.coeff_w_plus_rw[rw_idx1],
-                    rhs0,
-                    rhs1,
-                    rhs2
-                );
-
-                (*updated)[static_cast<size_t>(idx0)] = rhs0;
-                (*updated)[static_cast<size_t>(idx1)] = rhs1;
-                (*updated)[static_cast<size_t>(idx2)] = rhs2;
-                double local_max_delta = std::abs(rhs0 - previous[static_cast<size_t>(idx0)]);
-                local_max_delta = std::max(local_max_delta, std::abs(rhs1 - previous[static_cast<size_t>(idx1)]));
-                local_max_delta = std::max(local_max_delta, std::abs(rhs2 - previous[static_cast<size_t>(idx2)]));
-                return local_max_delta;
-            }
-
-            for (ssize_t w = 0; w < width_zones; ++w) {
-                const ssize_t idx = index(r, t, w);
-                const size_t rw_idx = static_cast<size_t>(r * width_zones + w);
-                line_workspace.diagonal[static_cast<size_t>(w)] = compact_workspace.width_diagonal_rw[rw_idx];
-                if (w > 0) {
-                    line_workspace.lower[static_cast<size_t>(w - 1)] = -compact_workspace.coeff_w_minus_rw[rw_idx];
-                }
-                if (w + 1 < width_zones) {
-                    line_workspace.upper[static_cast<size_t>(w)] = -compact_workspace.coeff_w_plus_rw[rw_idx];
-                }
-                const ssize_t theta_prev = (t - 1 + theta_cells) % theta_cells;
-                const ssize_t theta_next = (t + 1) % theta_cells;
-                double line_rhs =
-                    rhs[static_cast<size_t>(idx)]
-                    + compact_workspace.coeff_theta_rw[rw_idx]
-                        * (
-                            theta_sweep[static_cast<size_t>(index(r, theta_prev, w))]
-                            + theta_sweep[static_cast<size_t>(index(r, theta_next, w))]
-                        );
-                if (r > 0) {
-                    line_rhs += compact_workspace.coeff_r_minus_rw[rw_idx] * theta_sweep[static_cast<size_t>(index(r - 1, t, w))];
-                }
-                if (r + 1 < radial_cells) {
-                    line_rhs += compact_workspace.coeff_r_plus_rw[rw_idx] * theta_sweep[static_cast<size_t>(index(r + 1, t, w))];
-                }
-                line_workspace.rhs[static_cast<size_t>(w)] = line_rhs;
-            }
-            solve_tridiagonal_in_place(line_workspace, width_zones);
-            double local_max_delta = 0.0;
-            for (ssize_t w = 0; w < width_zones; ++w) {
-                const ssize_t idx = index(r, t, w);
-                const double value = line_workspace.rhs[static_cast<size_t>(w)];
-                (*updated)[static_cast<size_t>(idx)] = value;
-                local_max_delta = std::max(
-                    local_max_delta,
-                    std::abs(value - previous[static_cast<size_t>(idx)])
-                );
-            }
-            return local_max_delta;
-        };
-
-        {
-            LineWorkspace radial_workspace(radial_cells);
+        for (ssize_t r = 0; r < radial_cells; ++r) {
             for (ssize_t t = 0; t < theta_cells; ++t) {
+                const ssize_t t_minus = (t - 1 + theta_cells) % theta_cells;
+                const ssize_t t_plus = (t + 1) % theta_cells;
                 for (ssize_t w = 0; w < width_zones; ++w) {
-                    solve_radial_line(radial_workspace, t, w);
-                }
-            }
+                    const ssize_t idx = index(r, t, w);
+                    const size_t rw_idx = static_cast<size_t>(r * width_zones + w);
 
-            LineWorkspace theta_workspace(theta_cells);
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                for (ssize_t w = 0; w < width_zones; ++w) {
-                    solve_theta_line(theta_workspace, r, w);
-                }
-            }
+                    const double coeff_r_minus = compact_workspace.coeff_r_minus_rw[rw_idx];
+                    const double coeff_r_plus = compact_workspace.coeff_r_plus_rw[rw_idx];
+                    const double coeff_theta = compact_workspace.coeff_theta_rw[rw_idx];
+                    const double coeff_w_minus = compact_workspace.coeff_w_minus_rw[rw_idx];
+                    const double coeff_w_plus = compact_workspace.coeff_w_plus_rw[rw_idx];
 
-            LineWorkspace width_workspace(width_zones);
-            for (ssize_t r = 0; r < radial_cells; ++r) {
-                for (ssize_t t = 0; t < theta_cells; ++t) {
-                    max_delta = std::max(max_delta, solve_width_line(width_workspace, r, t));
+                    double neighbor_sum = 0.0;
+                    double diagonal = 1.0;
+                    if (r > 0) {
+                        neighbor_sum += coeff_r_minus * (*estimate)[static_cast<size_t>(index(r - 1, t, w))];
+                        diagonal += dt_s * coeff_r_minus;
+                    }
+                    if (r + 1 < radial_cells) {
+                        neighbor_sum += coeff_r_plus * (*estimate)[static_cast<size_t>(index(r + 1, t, w))];
+                        diagonal += dt_s * coeff_r_plus;
+                    }
+
+                    neighbor_sum += coeff_theta * (*estimate)[static_cast<size_t>(index(r, t_minus, w))];
+                    neighbor_sum += coeff_theta * (*estimate)[static_cast<size_t>(index(r, t_plus, w))];
+                    diagonal += 2.0 * dt_s * coeff_theta;
+
+                    if (w > 0) {
+                        neighbor_sum += coeff_w_minus * (*estimate)[static_cast<size_t>(index(r, t, w - 1))];
+                        diagonal += dt_s * coeff_w_minus;
+                    }
+                    if (w + 1 < width_zones) {
+                        neighbor_sum += coeff_w_plus * (*estimate)[static_cast<size_t>(index(r, t, w + 1))];
+                        diagonal += dt_s * coeff_w_plus;
+                    }
+
+                    const double prior = (*estimate)[static_cast<size_t>(idx)];
+                    const double next =
+                        (rhs[static_cast<size_t>(idx)] + dt_s * neighbor_sum) / std::max(diagonal, 1e-12);
+                    (*estimate)[static_cast<size_t>(idx)] = next;
+                    max_delta = std::max(max_delta, std::abs(next - prior));
                 }
             }
         }
 
-        std::swap(estimate, updated);
         if (max_delta < diffusion_tolerance_k || solver_mode == DiffusionSolverMode::Adi) {
             break;
         }
