@@ -126,6 +126,55 @@ def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path
     assert "## Runtime Breakdown" in summary_text
 
 
+def test_default_cooldown_scenario_starts_hot_and_cools() -> None:
+    _root, run_module, _report_module = _load_modules()
+    cooldown = next(
+        scenario for scenario in run_module.default_scenarios(duration_scale=1.0)
+        if scenario.name == "cooldown"
+    )
+
+    assert cooldown.initial_tire_temp_k is not None
+    assert cooldown.initial_tire_temp_k > cooldown.ambient_temp_k
+    assert cooldown.initial_tire_temp_k > cooldown.track_temp_k
+    assert cooldown.brake_power_w == 0.0
+    assert cooldown.drive_power_w == 0.0
+
+    tire_params = run_module.default_tire_parameters(
+        radial_cells=4,
+        theta_cells=8,
+        internal_solver_dt_s=0.05,
+    )
+    trace = run_module.run_single_scenario_temperature_trace(
+        scenario=cooldown,
+        tire_parameters=tire_params,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+    )
+
+    assert trace["mean_core_temp_c"][0] > trace["end_mean_core_temp_c"]
+    assert trace["mean_surface_temp_c"][0] > trace["end_mean_surface_temp_c"]
+    assert trace["mean_surface_temp_c"][0] > trace["peak_mean_surface_temp_c"] - 1e-9
+
+
+def test_progress_bar_is_suppressed_when_stderr_is_not_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    _root, run_module, _report_module = _load_modules()
+
+    class _FakeStderr:
+        def isatty(self) -> bool:
+            return False
+
+    monkeypatch.setattr(run_module.sys, "stderr", _FakeStderr())
+    progress_tracker = run_module._build_progress_tracker(
+        scenarios=run_module.default_scenarios(duration_scale=0.05),
+        uq_scenario_count=5,
+        lhs_samples=2,
+        sobol_eval_count=10,
+        enabled=True,
+    )
+
+    assert progress_tracker.bar is None
+
+
 def test_p8_end_to_end_parallel_workers_match_serial_outputs(tmp_path: Path) -> None:
     _root, run_module, report_module = _load_modules()
     serial_results_path = tmp_path / "hf_serial.json"
@@ -225,6 +274,7 @@ def test_p8_sobol_surrogate_reduces_exact_eval_count(monkeypatch: pytest.MonkeyP
         return original(*args, **kwargs)
 
     monkeypatch.setattr(run_module, "_evaluate_sobol_payloads", counted)
+    monkeypatch.setattr(run_module, "_sobol_indices_are_plausible", lambda indices: True)
 
     result = run_module.run_sobol_uq(
         scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
@@ -249,6 +299,59 @@ def test_p8_sobol_surrogate_reduces_exact_eval_count(monkeypatch: pytest.MonkeyP
 
     assert exact_eval_counts == [9]
     assert result["objective_metric"].endswith(".peak_mean_surface_temp_c")
+
+
+def test_p8_sobol_surrogate_falls_back_when_sobol_structure_is_implausible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, run_module, _report_module = _load_modules()
+    scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
+    tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
+    baseline_result = run_module.run_sobol_uq(
+        scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        sobol_samples=3,
+        seed=77,
+        diagnostics_stride=1,
+        workers=1,
+        progress_tracker=None,
+        surrogate_config=run_module.UQSurrogateConfig(enabled=False),
+    )
+    eval_counts: list[int] = []
+    original = run_module._evaluate_sobol_payloads
+
+    def counted(*args, **kwargs):
+        eval_counts.append(len(kwargs["eval_payloads"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(run_module, "_evaluate_sobol_payloads", counted)
+
+    fallback_result = run_module.run_sobol_uq(
+        scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
+        tire_parameters=tire_parameters,
+        vehicle_parameters=run_module.VehicleParameters(),
+        dt_s=0.2,
+        uq=run_module.HighFidelityUQ(),
+        sobol_samples=3,
+        seed=77,
+        diagnostics_stride=1,
+        workers=1,
+        progress_tracker=None,
+        surrogate_config=run_module.UQSurrogateConfig(
+            enabled=True,
+            sobol_train_samples=6,
+            sobol_validation_samples=3,
+            min_prediction_samples=1,
+            max_rmse_c=1e9,
+            max_abs_error_c=1e9,
+        ),
+    )
+
+    assert eval_counts == [9, 66]
+    assert fallback_result == baseline_result
 
 
 def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(

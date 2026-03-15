@@ -88,12 +88,18 @@ class HighFidelityTireSimulator:
         self,
         *,
         ambient_temp_k: float = celsius_to_kelvin(25.0),
+        initial_tire_temp_k: float | None = None,
         wear: float = 0.0,
     ) -> HighFidelityTireState:
-        nodes = np.full(self.parameters.thermal_node_count, float(ambient_temp_k), dtype=float)
+        resolved_initial_tire_temp_k = (
+            float(ambient_temp_k)
+            if initial_tire_temp_k is None
+            else float(initial_tire_temp_k)
+        )
+        nodes = np.full(self.parameters.thermal_node_count, resolved_initial_tire_temp_k, dtype=float)
         width_zones = self.parameters.width_zones
         thermal_field_rtw = (
-            self._thermal_solver.initial_temperature_field(ambient_temp_k)
+            self._thermal_solver.initial_temperature_field(resolved_initial_tire_temp_k)
             if self.parameters.use_2d_thermal_solver
             else None
         )
@@ -102,8 +108,16 @@ class HighFidelityTireSimulator:
             if thermal_field_rtw is not None
             else None
         )
-        flash_field_tw = np.full((self.parameters.theta_cells, width_zones), float(ambient_temp_k), dtype=float)
-        sidewall_field_tw = np.full((self.parameters.theta_cells, width_zones), float(ambient_temp_k), dtype=float)
+        flash_field_tw = np.full(
+            (self.parameters.theta_cells, width_zones),
+            resolved_initial_tire_temp_k,
+            dtype=float,
+        )
+        sidewall_field_tw = np.full(
+            (self.parameters.theta_cells, width_zones),
+            resolved_initial_tire_temp_k,
+            dtype=float,
+        )
         zero_w = np.zeros(width_zones, dtype=float)
         pressure_patch = self.parameters.pressure_patch
         dynamic_volume_m3 = max(
@@ -113,7 +127,7 @@ class HighFidelityTireSimulator:
         dynamic_pressure_pa = (
             pressure_patch.resolved_gas_mass_kg()
             * pressure_patch.gas_specific_constant_j_per_kgk
-            * ambient_temp_k
+            * resolved_initial_tire_temp_k
             / max(dynamic_volume_m3, 1e-12)
         )
         return HighFidelityTireState(
@@ -178,11 +192,11 @@ class HighFidelityTireSimulator:
             last_cavity_to_rim_heat_w=0.0,
             last_gas_to_inner_liner_heat_w=0.0,
             last_gas_to_rim_heat_w=0.0,
-            last_brake_disc_temp_k=float(ambient_temp_k),
+            last_brake_disc_temp_k=resolved_initial_tire_temp_k,
             last_brake_disc_to_rim_heat_w=0.0,
             last_brake_disc_to_tire_heat_w=0.0,
             last_brake_disc_to_sidewall_heat_w=0.0,
-            last_effective_contact_temp_k=float(ambient_temp_k),
+            last_effective_contact_temp_k=resolved_initial_tire_temp_k,
             last_adhesion_power_w=0.0,
             last_sliding_power_w=0.0,
             last_contact_pressure_factor=1.0,

@@ -79,14 +79,21 @@ class HighFidelityVehicleSimulator:
         self,
         *,
         ambient_temp_k: float = celsius_to_kelvin(25.0),
+        initial_tire_temp_k: float | None = None,
         wear: float = 0.0,
         wear_by_wheel: Mapping[WheelId, float] | None = None,
     ) -> HighFidelityVehicleState:
         states: dict[WheelId, HighFidelityTireState] = {}
+        resolved_initial_tire_temp_k = (
+            float(ambient_temp_k)
+            if initial_tire_temp_k is None
+            else float(initial_tire_temp_k)
+        )
         for wheel in WHEEL_IDS:
             wheel_wear = wear if wear_by_wheel is None else wear_by_wheel.get(wheel, wear)
             states[wheel] = self._tire_simulators[wheel].initial_state(
                 ambient_temp_k=ambient_temp_k,
+                initial_tire_temp_k=resolved_initial_tire_temp_k,
                 wear=wheel_wear,
             )
         return HighFidelityVehicleState(wheel_states=states, time_s=0.0)

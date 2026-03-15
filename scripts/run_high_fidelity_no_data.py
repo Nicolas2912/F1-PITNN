@@ -111,6 +111,7 @@ class ScenarioConfig:
     drive_power_w: float
     ambient_temp_k: float
     track_temp_k: float
+    initial_tire_temp_k: float | None = None
     road_bulk_temp_k: float | None = None
     wind_mps: float = 0.0
     wind_yaw_rad: float = 0.0
@@ -455,19 +456,20 @@ def default_scenarios(*, duration_scale: float = 1.0) -> tuple[ScenarioConfig, .
         ScenarioConfig(
             name="cooldown",
             duration_s=7.0 * duration_scale,
-            speed_mps=34.0,
-            ax_mps2=-1.4,
+            speed_mps=26.0,
+            ax_mps2=0.0,
             ay_mps2=0.0,
             steering_angle_rad=0.0,
             yaw_rate_radps=0.0,
-            brake_power_w=8_000.0,
+            brake_power_w=0.0,
             drive_power_w=0.0,
-            ambient_temp_k=301.15,
-            track_temp_k=312.15,
-            road_bulk_temp_k=308.15,
-            wind_mps=9.0,
+            ambient_temp_k=296.15,
+            initial_tire_temp_k=312.15,
+            track_temp_k=294.15,
+            road_bulk_temp_k=293.15,
+            wind_mps=11.0,
             humidity_rel=0.68,
-            solar_w_m2=120.0,
+            solar_w_m2=0.0,
             road_moisture=0.20,
             rubbering_level=0.50,
             asphalt_roughness=0.96,
@@ -518,6 +520,14 @@ def _vehicle_inputs_for_scenario(scenario: ScenarioConfig) -> VehicleInputs:
         rubbering_level=scenario.rubbering_level,
         asphalt_roughness=scenario.asphalt_roughness,
         asphalt_effusivity=scenario.asphalt_effusivity,
+    )
+
+
+def _initial_tire_temp_k_for_scenario(scenario: ScenarioConfig) -> float:
+    return (
+        float(scenario.ambient_temp_k)
+        if scenario.initial_tire_temp_k is None
+        else float(scenario.initial_tire_temp_k)
     )
 
 
@@ -842,10 +852,69 @@ def _sobol_surrogate_error_summary(
     return float(np.sqrt(np.mean(delta * delta))), float(np.max(np.abs(delta)))
 
 
+def _sobol_indices_are_plausible(
+    indices,
+    *,
+    first_order_sum_limit: float = 1.2,
+    total_order_margin: float = 0.02,
+    max_significant_violations: int = 2,
+) -> bool:
+    first_order_sum = float(sum(float(index.first_order) for index in indices))
+    significant_violations = sum(
+        1
+        for index in indices
+        if float(index.total_order) + float(total_order_margin) < float(index.first_order)
+    )
+    return first_order_sum <= float(first_order_sum_limit) and significant_violations <= int(
+        max_significant_violations
+    )
+
+
+def _select_sobol_metric(
+    *,
+    metric_candidates: tuple[str, ...],
+    ordered_metrics: dict[str, np.ndarray],
+    sobol_samples: int,
+    y_ab_offsets: list[int],
+    uq: HighFidelityUQ,
+    priors,
+):
+    selected_metric = metric_candidates[0]
+    selected_sobol = None
+    fallback_metric = None
+    for metric_name in metric_candidates:
+        ordered_results = ordered_metrics[metric_name]
+        y_a = ordered_results[:sobol_samples]
+        y_b = ordered_results[sobol_samples : 2 * sobol_samples]
+        y_ab_by_dim = [ordered_results[offset : offset + sobol_samples] for offset in y_ab_offsets]
+        sobol = uq.sobol_indices_from_evaluations(
+            priors=priors,
+            y_a=y_a,
+            y_b=y_b,
+            y_ab_by_dim=y_ab_by_dim,
+        )
+        if fallback_metric is None:
+            fallback_metric = metric_name
+            selected_sobol = sobol
+        if sobol.variance > 1e-12:
+            selected_metric = metric_name
+            selected_sobol = sobol
+            break
+
+    assert selected_sobol is not None
+    if selected_sobol.variance <= 1e-12:
+        selected_metric = fallback_metric if fallback_metric is not None else metric_candidates[0]
+    return selected_metric, selected_sobol
+
+
 def _should_enable_progress(enabled: bool | None) -> bool:
-    if enabled is not None:
-        return enabled
-    return sys.stderr.isatty()
+    # Only render the live tqdm bar on an interactive stderr. Redirected output
+    # (for example `2>&1 | tee ...`) should keep collecting timings without
+    # writing carriage-return progress frames into the log.
+    stderr_is_tty = sys.stderr.isatty()
+    if enabled is None:
+        return stderr_is_tty
+    return bool(enabled) and stderr_is_tty
 
 
 def _build_progress_tracker(
@@ -1091,7 +1160,10 @@ def run_single_scenario(
     active_prepared_inputs = (
         active_simulator.prepare_inputs(active_inputs) if prepared_inputs is None else prepared_inputs
     )
-    state = active_simulator.initial_state(ambient_temp_k=scenario.ambient_temp_k)
+    state = active_simulator.initial_state(
+        ambient_temp_k=scenario.ambient_temp_k,
+        initial_tire_temp_k=_initial_tire_temp_k_for_scenario(scenario),
+    )
 
     steps = max(int(round(scenario.duration_s / dt_s)), 1)
     time_s = [0.0]
@@ -1182,7 +1254,10 @@ def run_single_scenario_temperature_trace(
     active_prepared_inputs = (
         active_simulator.prepare_inputs(active_inputs) if prepared_inputs is None else prepared_inputs
     )
-    state = active_simulator.initial_state(ambient_temp_k=scenario.ambient_temp_k)
+    state = active_simulator.initial_state(
+        ambient_temp_k=scenario.ambient_temp_k,
+        initial_tire_temp_k=_initial_tire_temp_k_for_scenario(scenario),
+    )
 
     steps = max(int(round(scenario.duration_s / dt_s)), 1)
     mean_core_temp_c: list[float] = []
@@ -1375,6 +1450,9 @@ def run_sobol_uq(
 
     eval_payloads: list[tuple[int, dict[str, float]]] = []
     y_ab_offsets: list[int] = []
+    surrogate_result_by_eval_idx: dict[int, dict[str, float]] | None = None
+    surrogate_predicted_payloads: list[tuple[int, dict[str, float]]] = []
+    pending_surrogate_progress = 0
     for row_idx in range(sobol_samples):
         eval_payloads.append((row_idx, {name: float(value) for name, value in zip(prior_names, matrix_a[row_idx], strict=True)}))
     for row_idx in range(sobol_samples):
@@ -1481,8 +1559,9 @@ def run_sobol_uq(
                             metric_name: float(prediction_matrix[row_idx, metric_idx])
                             for metric_idx, metric_name in enumerate(metric_candidates)
                         }
-                if progress_tracker is not None:
-                    progress_tracker.advance(len(predicted_payloads))
+                surrogate_result_by_eval_idx = result_by_eval_idx
+                surrogate_predicted_payloads = list(predicted_payloads)
+                pending_surrogate_progress = len(predicted_payloads)
                 sobol_results = sorted(result_by_eval_idx.items(), key=lambda item: item[0])
             else:
                 predicted_results = _evaluate_sobol_payloads(
@@ -1534,34 +1613,48 @@ def run_sobol_uq(
         for metric_name in metric_candidates:
             ordered_metrics[metric_name][eval_idx] = float(values[metric_name])
 
-    selected_metric = metric_candidates[0]
-    selected_sobol = None
-    fallback_metric = None
-    for metric_name in metric_candidates:
-        ordered_results = ordered_metrics[metric_name]
-        y_a = ordered_results[:sobol_samples]
-        y_b = ordered_results[sobol_samples : 2 * sobol_samples]
-        y_ab_by_dim = [
-            ordered_results[offset : offset + sobol_samples]
-            for offset in y_ab_offsets
-        ]
-        sobol = uq.sobol_indices_from_evaluations(
-            priors=priors,
-            y_a=y_a,
-            y_b=y_b,
-            y_ab_by_dim=y_ab_by_dim,
+    selected_metric, selected_sobol = _select_sobol_metric(
+        metric_candidates=metric_candidates,
+        ordered_metrics=ordered_metrics,
+        sobol_samples=sobol_samples,
+        y_ab_offsets=y_ab_offsets,
+        uq=uq,
+        priors=priors,
+    )
+    if (
+        surrogate_result_by_eval_idx is not None
+        and surrogate_predicted_payloads
+        and not _sobol_indices_are_plausible(selected_sobol.indices)
+    ):
+        predicted_results = _evaluate_sobol_payloads(
+            eval_payloads=surrogate_predicted_payloads,
+            scenario=scenario,
+            scenario_inputs=scenario_inputs,
+            tire_parameters=tire_parameters,
+            vehicle_parameters=vehicle_parameters,
+            dt_s=dt_s,
+            diagnostics_stride=diagnostics_stride,
+            workers=workers,
+            progress_tracker=progress_tracker,
+            pool_runner=pool_runner,
         )
-        if fallback_metric is None:
-            fallback_metric = metric_name
-            selected_sobol = sobol
-        if sobol.variance > 1e-12:
-            selected_metric = metric_name
-            selected_sobol = sobol
-            break
-
-    assert selected_sobol is not None
-    if selected_sobol.variance <= 1e-12:
-        selected_metric = fallback_metric if fallback_metric is not None else metric_candidates[0]
+        surrogate_result_by_eval_idx.update({eval_idx: values for eval_idx, values in predicted_results})
+        for metric_name in metric_candidates:
+            ordered_metrics[metric_name].fill(0.0)
+        for eval_idx, values in surrogate_result_by_eval_idx.items():
+            for metric_name in metric_candidates:
+                ordered_metrics[metric_name][eval_idx] = float(values[metric_name])
+        selected_metric, selected_sobol = _select_sobol_metric(
+            metric_candidates=metric_candidates,
+            ordered_metrics=ordered_metrics,
+            sobol_samples=sobol_samples,
+            y_ab_offsets=y_ab_offsets,
+            uq=uq,
+            priors=priors,
+        )
+        pending_surrogate_progress = 0
+    if progress_tracker is not None and pending_surrogate_progress > 0:
+        progress_tracker.advance(pending_surrogate_progress)
     return {
         "objective_metric": f"{scenario.name}.{selected_metric}",
         "variance": selected_sobol.variance,

@@ -78,6 +78,54 @@ def test_p7_sobol_ranking_identifies_dominant_parameter() -> None:
         assert 0.0 <= index.total_order <= 1.0
 
 
+def test_p7_sobol_interaction_inflates_total_order_over_first_order() -> None:
+    uq = HighFidelityUQ()
+    priors = (
+        ParameterPrior(name="x1", lower=0.0, upper=1.0),
+        ParameterPrior(name="x2", lower=0.0, upper=1.0),
+        ParameterPrior(name="x3", lower=0.0, upper=1.0),
+    )
+
+    result = uq.sobol_indices(
+        priors=priors,
+        sample_count=4096,
+        seed=2026,
+        model_fn=lambda sample: sample["x1"] * sample["x2"] + 0.05 * sample["x3"],
+    )
+    by_name = {index.name: index for index in result.indices}
+
+    assert by_name["x1"].total_order > by_name["x1"].first_order
+    assert by_name["x2"].total_order > by_name["x2"].first_order
+    assert by_name["x1"].first_order < by_name["x1"].total_order
+    assert by_name["x2"].first_order < by_name["x2"].total_order
+
+
+def test_p7_sobol_preserves_total_order_when_raw_estimate_is_below_first_order() -> None:
+    uq = HighFidelityUQ()
+    priors = (
+        ParameterPrior(name="x1", lower=0.0, upper=1.0),
+        ParameterPrior(name="x2", lower=0.0, upper=1.0),
+    )
+
+    y_a = np.array([0.0, 1.0, 0.0, 1.0], dtype=float)
+    y_b = np.array([0.0, 1.0, 1.0, 0.0], dtype=float)
+    y_ab_by_dim = (
+        np.array([0.1, 0.9, 0.9, 0.1], dtype=float),
+        np.array([0.0, 1.0, 0.1, 0.9], dtype=float),
+    )
+
+    result = uq.sobol_indices_from_evaluations(
+        priors=priors,
+        y_a=y_a,
+        y_b=y_b,
+        y_ab_by_dim=y_ab_by_dim,
+    )
+    by_name = {index.name: index for index in result.indices}
+
+    assert by_name["x1"].first_order > by_name["x1"].total_order
+    assert by_name["x2"].first_order > by_name["x2"].total_order
+
+
 def test_p7_lhs_screen_returns_deterministic_envelopes() -> None:
     uq = HighFidelityUQ()
     priors = uq.default_tire_priors()
