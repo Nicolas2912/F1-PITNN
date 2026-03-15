@@ -7,11 +7,8 @@ import numpy as np
 from models.high_fidelity import (
     HighFidelityTireInputs,
     HighFidelityTireSimulator,
-    inputs_from_legacy,
-    state_from_legacy,
-    state_to_legacy,
 )
-from models.physics import TireInputs, TireThermalSimulator, celsius_to_kelvin
+from models.physics import celsius_to_kelvin
 
 
 def test_high_fidelity_no_op_step_preserves_temperatures_and_advances_time() -> None:
@@ -41,46 +38,6 @@ def test_high_fidelity_no_op_step_preserves_temperatures_and_advances_time() -> 
     assert diag.loss_modulus_pa >= 0.0
     assert diag.hysteresis_power_density_w_per_m3 >= 0.0
     assert diag.energy_source_total_w >= 0.0
-
-
-def test_high_fidelity_legacy_adapters_roundtrip_state_and_inputs() -> None:
-    legacy_inputs = TireInputs(
-        speed_mps=64.0,
-        wheel_angular_speed_radps=202.0,
-        normal_load_n=3_900.0,
-        slip_ratio=0.09,
-        slip_angle_rad=0.06,
-        brake_power_w=3_500.0,
-        ambient_temp_k=celsius_to_kelvin(29.0),
-        track_temp_k=celsius_to_kelvin(43.0),
-    )
-    hf_inputs = inputs_from_legacy(legacy_inputs)
-
-    assert math.isclose(hf_inputs.speed_mps, legacy_inputs.speed_mps, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(hf_inputs.slip_ratio_cmd, legacy_inputs.slip_ratio, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(
-        hf_inputs.slip_angle_cmd_rad,
-        legacy_inputs.slip_angle_rad,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    )
-    assert math.isclose(
-        hf_inputs.road_surface_temp_k or 0.0,
-        legacy_inputs.track_temp_k,
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    )
-
-    legacy_sim = TireThermalSimulator()
-    legacy_state = legacy_sim.initial_state(ambient_temp_k=celsius_to_kelvin(31.0), wear=0.08)
-    hf_state = state_from_legacy(legacy_state)
-    roundtrip = state_to_legacy(hf_state)
-
-    assert hf_state.temperature_nodes_k.shape == (9,)
-    assert math.isclose(roundtrip.t_carcass_k, legacy_state.t_carcass_k, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(roundtrip.t_sidewall_k, legacy_state.t_sidewall_k, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(roundtrip.wear, legacy_state.wear, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(roundtrip.time_s, legacy_state.time_s, rel_tol=0.0, abs_tol=1e-12)
 
 
 def test_high_fidelity_simulate_stream_length_and_time_progression() -> None:

@@ -86,28 +86,9 @@ class TireState:
 
     @classmethod
     def from_vector(cls, values: np.ndarray, time_s: float) -> TireState:
-        valid_shapes = ((STATE_DIMENSION,), (10,), (9,))
-        if values.shape not in valid_shapes:
-            msg = f"Expected shape {valid_shapes}, got {values.shape}"
+        if values.shape != (STATE_DIMENSION,):
+            msg = f"Expected shape {(STATE_DIMENSION,)}, got {values.shape}"
             raise ValueError(msg)
-
-        if values.shape == (9,):
-            # Backward-compatible decode for persisted 8-node vectors.
-            sidewall_k = float(values[CARCASS_INDEX])
-            kappa_dyn = 0.0
-            alpha_dyn = 0.0
-            wear = float(values[8])
-        elif values.shape == (10,):
-            # Backward-compatible decode for persisted sidewall-only vectors.
-            sidewall_k = float(values[SIDEWALL_INDEX])
-            kappa_dyn = 0.0
-            alpha_dyn = 0.0
-            wear = float(values[9])
-        else:
-            sidewall_k = float(values[SIDEWALL_INDEX])
-            kappa_dyn = float(values[KAPPA_DYN_INDEX])
-            alpha_dyn = float(values[ALPHA_DYN_INDEX])
-            wear = float(values[WEAR_INDEX])
         return cls(
             t_surface_inner_k=float(values[SURFACE_INNER_INDEX]),
             t_surface_middle_k=float(values[SURFACE_MIDDLE_INDEX]),
@@ -117,28 +98,12 @@ class TireState:
             t_gas_k=float(values[GAS_INDEX]),
             t_rim_k=float(values[RIM_INDEX]),
             t_brake_k=float(values[BRAKE_INDEX]),
-            t_sidewall_k=sidewall_k,
-            kappa_dyn=kappa_dyn,
-            alpha_dyn_rad=alpha_dyn,
-            wear=wear,
+            t_sidewall_k=float(values[SIDEWALL_INDEX]),
+            kappa_dyn=float(values[KAPPA_DYN_INDEX]),
+            alpha_dyn_rad=float(values[ALPHA_DYN_INDEX]),
+            wear=float(values[WEAR_INDEX]),
             time_s=time_s,
         )
-
-    @classmethod
-    def from_legacy_vector_9(cls, values: np.ndarray, time_s: float) -> TireState:
-        """Construct from legacy state vector: 8 thermal nodes + wear."""
-        if values.shape != (9,):
-            msg = f"Expected shape (9,), got {values.shape}"
-            raise ValueError(msg)
-        return cls.from_vector(values, time_s=time_s)
-
-    @classmethod
-    def from_legacy_vector_10(cls, values: np.ndarray, time_s: float) -> TireState:
-        """Construct from legacy state vector: 9 thermal nodes + wear."""
-        if values.shape != (10,):
-            msg = f"Expected shape (10,), got {values.shape}"
-            raise ValueError(msg)
-        return cls.from_vector(values, time_s=time_s)
 
 
 @dataclass(frozen=True)

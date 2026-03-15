@@ -1,6 +1,4 @@
 """High-fidelity tire model modules (P1-P5)."""
-
-from .adapters import inputs_from_legacy, state_from_legacy, state_to_legacy
 from .boundary_conditions import (
     BoundaryConditionModel,
     BoundaryHeatFlows,
@@ -43,9 +41,6 @@ __all__ = [
     "BoundaryConditionModel",
     "BoundaryHeatFlows",
     "BoundaryState",
-    "inputs_from_legacy",
-    "state_from_legacy",
-    "state_to_legacy",
     "ThermalFieldSolver2D",
     "ThermalSolverStepResult",
     "ViscoelasticMaterialModel",

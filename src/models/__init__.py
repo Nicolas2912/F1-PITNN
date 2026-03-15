@@ -24,9 +24,6 @@ from .high_fidelity import (
     ViscoelasticMaterialModel,
     WheelCouplingResult,
     WheelForceCouplingModel,
-    inputs_from_legacy,
-    state_from_legacy,
-    state_to_legacy,
 )
 from .physics import (
     TireDiagnostics,
@@ -82,8 +79,5 @@ __all__ = [
     "VehicleThermalSimulator",
     "WheelId",
     "celsius_to_kelvin",
-    "inputs_from_legacy",
     "kelvin_to_celsius",
-    "state_from_legacy",
-    "state_to_legacy",
 ]

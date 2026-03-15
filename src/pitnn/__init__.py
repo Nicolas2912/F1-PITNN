@@ -11,7 +11,7 @@ def main() -> None:
     config: RuntimeConfig = load_runtime_config(config_path)
     set_global_seed(config.seed, deterministic=config.deterministic)
     print(
-        "PITNN scaffold ready "
+        "PITNN high-fidelity harness ready "
         f"(seed={config.seed}, deterministic={config.deterministic}, device={config.device})"
     )
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 import numpy as np
+import pytest
 
 from models.physics import TireInputs, TireModelParameters, TireState, TireThermalSimulator, celsius_to_kelvin
 
@@ -145,22 +146,8 @@ def test_phase1_sidewall_node_behaves_as_carcass_heat_sink() -> None:
     assert rates_phase1["carcass"] < rates_legacy["carcass"]
 
 
-def test_phase6_legacy_state_vector_constructors_are_supported() -> None:
-    legacy9 = np.array(
-        [
-            celsius_to_kelvin(40.0),
-            celsius_to_kelvin(41.0),
-            celsius_to_kelvin(42.0),
-            celsius_to_kelvin(43.0),
-            celsius_to_kelvin(44.0),
-            celsius_to_kelvin(45.0),
-            celsius_to_kelvin(46.0),
-            celsius_to_kelvin(47.0),
-            0.12,
-        ],
-        dtype=float,
-    )
-    legacy10 = np.array(
+def test_phase6_state_vector_roundtrip_requires_full_state_dimension() -> None:
+    full_state = np.array(
         [
             celsius_to_kelvin(40.0),
             celsius_to_kelvin(41.0),
@@ -171,18 +158,22 @@ def test_phase6_legacy_state_vector_constructors_are_supported() -> None:
             celsius_to_kelvin(46.0),
             celsius_to_kelvin(47.0),
             celsius_to_kelvin(48.0),
+            0.03,
+            0.02,
             0.13,
         ],
         dtype=float,
     )
 
-    state9 = TireState.from_legacy_vector_9(legacy9, time_s=1.5)
-    state10 = TireState.from_legacy_vector_10(legacy10, time_s=2.5)
+    state = TireState.from_vector(full_state, time_s=2.5)
 
-    assert math.isclose(state9.t_sidewall_k, state9.t_carcass_k, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(state10.t_sidewall_k, legacy10[8], rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(state9.kappa_dyn, 0.0, rel_tol=0.0, abs_tol=1e-12)
-    assert math.isclose(state10.alpha_dyn_rad, 0.0, rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(state.t_sidewall_k, full_state[8], rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(state.kappa_dyn, full_state[9], rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(state.alpha_dyn_rad, full_state[10], rel_tol=0.0, abs_tol=1e-12)
+    assert math.isclose(state.wear, full_state[11], rel_tol=0.0, abs_tol=1e-12)
+
+    with pytest.raises(ValueError):
+        TireState.from_vector(full_state[:10], time_s=1.5)
 
 
 def test_phase2_slip_transient_lags_then_tracks_command() -> None:

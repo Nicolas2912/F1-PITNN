@@ -1,9 +1,4 @@
-runtime:
-  project_name: pitnn
-  seed: 42
-  deterministic: true
-  device: cpu
-
-data:
-  telemetry_hz: 10
-  horizon_seconds: 5
+project_name: pitnn
+seed: 42
+deterministic: true
+device: cpu
