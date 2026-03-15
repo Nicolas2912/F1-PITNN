@@ -51,7 +51,7 @@ def _normalized_summary(text: str) -> str:
         and not line.startswith("- results_json:")
         and not line.startswith("- summary_md:")
         and not line.startswith("- total_elapsed_s:")
-        and not line.startswith("| baseline |")
+        and not line.startswith("| nominal |")
         and not line.startswith("| lhs |")
         and not line.startswith("| sobol |")
         and not line.startswith("| done |")
@@ -109,7 +109,7 @@ def test_p8_end_to_end_harness_generates_results_and_report_smoke(tmp_path: Path
     assert payload["metadata"]["radial_cells"] == 4
     assert payload["metadata"]["theta_cells"] == 8
     assert payload["timing"]["total_elapsed_s"] >= 0.0
-    assert set(payload["timing"]["phases"]) >= {"baseline", "lhs", "sobol", "done"}
+    assert set(payload["timing"]["phases"]) >= {"nominal", "lhs", "sobol", "done"}
     assert "scenario_envelopes" in payload["uq"]["lhs"]
     assert len(payload["uq"]["sobol"]["indices"]) > 0
     assert "all_outputs_finite" in payload["plausibility_checks"]
@@ -223,7 +223,7 @@ def test_p8_end_to_end_parallel_workers_match_serial_outputs(tmp_path: Path) -> 
     assert _normalized_summary(serial_rerendered) == _normalized_summary(parallel_rerendered)
 
 
-def test_p8_sobol_surrogate_keeps_baseline_artifact_identical(tmp_path: Path) -> None:
+def test_p8_sobol_surrogate_keeps_nominal_artifact_identical(tmp_path: Path) -> None:
     _root, run_module, _report_module = _load_modules()
     exact_results_path = tmp_path / "hf_exact.json"
     exact_summary_path = tmp_path / "hf_exact.md"
@@ -258,7 +258,7 @@ def test_p8_sobol_surrogate_keeps_baseline_artifact_identical(tmp_path: Path) ->
 
     exact_payload = json.loads(exact_results_path.read_text(encoding="utf-8"))
     surrogate_payload = json.loads(surrogate_results_path.read_text(encoding="utf-8"))
-    assert exact_payload["baseline"] == surrogate_payload["baseline"]
+    assert exact_payload["nominal"] == surrogate_payload["nominal"]
     assert surrogate_payload["metadata"]["uq_surrogate"]["enabled"] is True
 
 
@@ -307,7 +307,7 @@ def test_p8_sobol_surrogate_falls_back_when_sobol_structure_is_implausible(
     _root, run_module, _report_module = _load_modules()
     scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
     tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
-    baseline_result = run_module.run_sobol_uq(
+    nominal_result = run_module.run_sobol_uq(
         scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
         tire_parameters=tire_parameters,
         vehicle_parameters=run_module.VehicleParameters(),
@@ -351,7 +351,7 @@ def test_p8_sobol_surrogate_falls_back_when_sobol_structure_is_implausible(
     )
 
     assert eval_counts == [9, 66]
-    assert fallback_result == baseline_result
+    assert fallback_result == nominal_result
 
 
 def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(
@@ -360,7 +360,7 @@ def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(
     _root, run_module, _report_module = _load_modules()
     scenarios = tuple(s for s in run_module.default_scenarios(duration_scale=0.05) if s.include_in_uq)
     tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
-    baseline_result = run_module.run_sobol_uq(
+    nominal_result = run_module.run_sobol_uq(
         scenario=next(s for s in scenarios if s.name == "combined_brake_corner"),
         tire_parameters=tire_parameters,
         vehicle_parameters=run_module.VehicleParameters(),
@@ -409,7 +409,7 @@ def test_p8_sobol_surrogate_falls_back_when_validation_error_exceeds_thresholds(
     )
 
     assert eval_counts == [9, 66]
-    assert fallback_result == baseline_result
+    assert fallback_result == nominal_result
 
 
 def test_p8_lhs_progress_advances_per_sample_in_serial_mode() -> None:
@@ -565,7 +565,7 @@ def test_p8_sobol_falls_back_from_degenerate_surface_metric(monkeypatch: pytest.
     assert any(index["total_order"] > 0.0 for index in result["indices"])
 
 
-def test_p8_baseline_parallel_progress_updates_before_all_results_are_sorted(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_p8_nominal_parallel_progress_updates_before_all_results_are_sorted(monkeypatch: pytest.MonkeyPatch) -> None:
     _root, run_module, _report_module = _load_modules()
     scenarios = run_module.default_scenarios(duration_scale=0.05)[:3]
     tire_parameters = run_module.default_tire_parameters(radial_cells=4, theta_cells=8, internal_solver_dt_s=0.05)
@@ -608,7 +608,7 @@ def test_p8_baseline_parallel_progress_updates_before_all_results_are_sorted(mon
         progress_tracker=progress_tracker,
     )
 
-    assert progress_tracker.phases == ["baseline"]
+    assert progress_tracker.phases == ["nominal"]
     assert progress_tracker.advances == [1, 1, 1]
     assert completion_order == [scenario.name for scenario in reversed(scenarios)]
     assert list(result["scenario_summaries"]) == [scenario.name for scenario in scenarios]
@@ -789,8 +789,8 @@ def test_p8_end_to_end_harness_generates_results_and_report_fullish(tmp_path: Pa
     payload = json.loads(results_path.read_text(encoding="utf-8"))
     assert payload["metadata"]["lhs_samples"] == 2
     assert payload["metadata"]["sobol_samples"] == 2
-    assert payload["metadata"]["default_output_mode"] == "bands_plus_baseline"
-    assert set(payload["baseline"]["scenario_summaries"]) == {
+    assert payload["metadata"]["default_output_mode"] == "bands_plus_nominal"
+    assert set(payload["nominal"]["scenario_summaries"]) == {
         "steady_corner",
         "combined_brake_corner",
         "long_stint",
@@ -804,14 +804,14 @@ def test_p8_end_to_end_harness_generates_results_and_report_fullish(tmp_path: Pa
     assert len(payload["uq"]["sobol"]["indices"]) > 0
     assert "all_peak_core_finite" in payload["plausibility_checks"]
     assert "all_outputs_finite" in payload["plausibility_checks"]
-    assert set(payload["timing"]["phases"]) >= {"baseline", "lhs", "sobol", "done"}
-    assert "peak_mean_surface_temp_c" in payload["baseline"]["scenario_summaries"]["steady_corner"]
+    assert set(payload["timing"]["phases"]) >= {"nominal", "lhs", "sobol", "done"}
+    assert "peak_mean_surface_temp_c" in payload["nominal"]["scenario_summaries"]["steady_corner"]
     assert (
-        payload["baseline"]["scenario_summaries"]["long_stint"]["end_mean_core_temp_c"]
-        > payload["baseline"]["scenario_summaries"]["long_stint"]["peak_mean_core_temp_c"] - 1e-9
+        payload["nominal"]["scenario_summaries"]["long_stint"]["end_mean_core_temp_c"]
+        > payload["nominal"]["scenario_summaries"]["long_stint"]["peak_mean_core_temp_c"] - 1e-9
     )
     assert (
-        payload["baseline"]["scenario_summaries"]["long_stint"]["end_mean_core_temp_c"]
+        payload["nominal"]["scenario_summaries"]["long_stint"]["end_mean_core_temp_c"]
         > 30.0
     )
     assert artifact["metadata"]["seed"] == 77

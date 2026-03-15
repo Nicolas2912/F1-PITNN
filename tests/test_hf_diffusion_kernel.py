@@ -53,7 +53,7 @@ def _normalized_summary(path: Path) -> str:
         and not line.startswith("- results_json:")
         and not line.startswith("- summary_md:")
         and not line.startswith("- total_elapsed_s:")
-        and not line.startswith("| baseline |")
+        and not line.startswith("| nominal |")
         and not line.startswith("| lhs |")
         and not line.startswith("| sobol |")
         and not line.startswith("| done |")

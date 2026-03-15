@@ -4,7 +4,7 @@ from __future__ import annotations
 def render_high_fidelity_no_data_summary(artifact: dict) -> str:
     metadata = artifact["metadata"]
     timing = artifact.get("timing", {})
-    scenario_summaries = artifact["baseline"]["scenario_summaries"]
+    scenario_summaries = artifact["nominal"]["scenario_summaries"]
     plausibility = artifact["plausibility_checks"]
     sobol = artifact["uq"]["sobol"]
 
@@ -22,11 +22,11 @@ def render_high_fidelity_no_data_summary(artifact: dict) -> str:
         f"- radial_cells: {metadata['radial_cells']}",
         f"- theta_cells: {metadata['theta_cells']}",
         f"- internal_solver_dt_s: {metadata['internal_solver_dt_s']:.3f}",
-        f"- default_output_mode: {metadata.get('default_output_mode', 'bands_plus_baseline')}",
+        f"- default_output_mode: {metadata.get('default_output_mode', 'bands_plus_nominal')}",
         "",
         "## UQ-First Scenario Metrics",
         "",
-        "| scenario | core_q05_c | core_q50_c | core_q95_c | surface_q50_c | surface_q95_c | baseline_core_end_c | baseline_surface_peak_c |",
+        "| scenario | core_q05_c | core_q50_c | core_q95_c | surface_q50_c | surface_q95_c | nominal_core_end_c | nominal_surface_peak_c |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for name, envelope in artifact["uq"]["lhs"]["scenario_envelopes"].items():
@@ -45,7 +45,7 @@ def render_high_fidelity_no_data_summary(artifact: dict) -> str:
     lines.extend(
         [
             "",
-            "## Deterministic Baseline",
+            "## Deterministic Nominal Run",
             "",
             "| scenario | end_mean_core_temp_c | peak_mean_core_temp_c | end_mean_surface_temp_c | peak_mean_surface_temp_c | max_load_error_pct | max_energy_residual_pct | coupling_convergence_rate |",
             "|---|---:|---:|---:|---:|---:|---:|---:|",

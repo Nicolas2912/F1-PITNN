@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 from queue import Empty
 import sys
@@ -349,6 +350,25 @@ def fidelity_preset(name: str) -> FidelityPreset:
         msg = f"Unknown preset '{name}'. Expected one of {sorted(PRESETS)}"
         raise ValueError(msg)
     return preset
+
+
+def _configure_runtime_acceleration() -> None:
+    os.environ["PITNN_USE_NATIVE_DIFFUSION"] = "1"
+    os.environ["PITNN_NATIVE_DIFFUSION_SOLVER"] = "adi"
+    os.environ["PITNN_USE_NATIVE_SIMULATOR_KERNELS"] = "1"
+
+
+def _resolve_output_paths(
+    *,
+    output_stem: Path | None,
+    output_json: Path,
+    output_summary: Path,
+) -> tuple[Path, Path]:
+    if output_stem is None:
+        return output_json, output_summary
+    stem_parent = output_stem.parent
+    stem_name = output_stem.name
+    return stem_parent / f"{stem_name}.json", stem_parent / f"{stem_name}.md"
 
 
 def default_tire_parameters(
@@ -926,7 +946,7 @@ def _build_progress_tracker(
     enabled: bool | None,
 ) -> ProgressTracker:
     phase_totals = {
-        "baseline": len(scenarios),
+        "nominal": len(scenarios),
         "lhs": int(lhs_samples) * max(int(uq_scenario_count), 1),
         "sobol": int(sobol_eval_count),
         "done": 0,
@@ -936,7 +956,7 @@ def _build_progress_tracker(
     total = len(scenarios) + phase_totals["lhs"] + sobol_eval_count
     bar = tqdm(
         total=total,
-        desc="baseline",
+        desc="nominal",
         unit="run",
         dynamic_ncols=True,
         leave=True,
@@ -962,6 +982,7 @@ def run_high_fidelity_no_data(
     vehicle_parameters: VehicleParameters | None = None,
     uq_surrogate: UQSurrogateConfig | None = None,
 ) -> dict:
+    _configure_runtime_acceleration()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -986,7 +1007,7 @@ def run_high_fidelity_no_data(
     )
     pool_runner = ProcessPoolRunner(workers=workers) if workers > 1 else None
     try:
-        baseline = run_scenario_pack(
+        nominal = run_scenario_pack(
             scenarios=scenarios,
             tire_parameters=tire_params,
             vehicle_parameters=vehicle_params,
@@ -1047,19 +1068,19 @@ def run_high_fidelity_no_data(
             "internal_solver_dt_s": float(tire_params.internal_solver_dt_s),
             "results_path": str(output_path),
             "summary_path": str(summary_path),
-            "default_output_mode": "bands_plus_baseline",
+            "default_output_mode": "bands_plus_nominal",
             "scenario_names": [scenario.name for scenario in scenarios],
             "uq_scenario_names": [scenario.name for scenario in scenarios if scenario.include_in_uq],
             "uq_surrogate": asdict(surrogate_config),
         },
         "timing": timing_summary,
         "priors": [asdict(prior) for prior in priors],
-        "baseline": baseline,
+        "nominal": nominal,
         "uq": {
             "lhs": lhs_result,
             "sobol": sobol_result,
         },
-        "plausibility_checks": build_plausibility_checks(baseline=baseline, sobol=sobol_result),
+        "plausibility_checks": build_plausibility_checks(nominal=nominal, sobol=sobol_result),
     }
 
     output_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
@@ -1091,7 +1112,7 @@ def run_scenario_pack(
     scenario_traces: dict[str, dict] = {}
     scenario_summaries: dict[str, dict] = {}
     if progress_tracker is not None:
-        progress_tracker.set_phase("baseline")
+        progress_tracker.set_phase("nominal")
     if workers > 1 and len(scenarios) > 1:
         tasks = [
             {
@@ -1662,8 +1683,8 @@ def run_sobol_uq(
     }
 
 
-def build_plausibility_checks(*, baseline: dict, sobol: dict) -> dict[str, bool]:
-    summaries = baseline["scenario_summaries"]
+def build_plausibility_checks(*, nominal: dict, sobol: dict) -> dict[str, bool]:
+    summaries = nominal["scenario_summaries"]
     return {
         "all_peak_core_finite": bool(
             all(np.isfinite(summary["peak_mean_core_temp_c"]) for summary in summaries.values())
@@ -1744,6 +1765,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Run high-fidelity no-data scenario harness.")
     parser.add_argument("--preset", choices=sorted(PRESETS), default="full")
+    parser.add_argument("--output-stem", type=Path, default=None)
     parser.add_argument("--output-json", type=Path, default=RESULTS_FILE)
     parser.add_argument("--output-summary", type=Path, default=SUMMARY_FILE)
     parser.add_argument("--lhs-samples", type=int, default=None)
@@ -1755,11 +1777,9 @@ def main() -> None:
     parser.add_argument("--theta-cells", type=int, default=None)
     parser.add_argument("--internal-dt-s", type=float, default=None)
     parser.add_argument("--diagnostics-stride", type=int, default=None)
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--uq-surrogate", choices=["none", "quadratic_ridge", "extra_trees"], default="none")
-    parser.add_argument("--uq-surrogate-sobol-train-samples", type=int, default=None)
-    parser.add_argument("--uq-surrogate-sobol-validation-samples", type=int, default=None)
-    parser.add_argument("--uq-surrogate-ridge-alpha", type=float, default=1e-6)
+    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
+    parser.add_argument("--uq-surrogate-sobol-train-samples", type=int, default=256)
+    parser.add_argument("--uq-surrogate-sobol-validation-samples", type=int, default=32)
     parser.add_argument("--uq-surrogate-max-rmse-c", type=float, default=0.75)
     parser.add_argument("--uq-surrogate-max-abs-error-c", type=float, default=2.0)
     parser.add_argument("--uq-surrogate-min-prediction-samples", type=int, default=32)
@@ -1774,12 +1794,16 @@ def main() -> None:
         theta_cells=preset.theta_cells if args.theta_cells is None else args.theta_cells,
         internal_solver_dt_s=preset.internal_solver_dt_s if args.internal_dt_s is None else args.internal_dt_s,
     )
+    output_json, output_summary = _resolve_output_paths(
+        output_stem=args.output_stem,
+        output_json=args.output_json,
+        output_summary=args.output_summary,
+    )
     surrogate_config = UQSurrogateConfig(
-        enabled=args.uq_surrogate != "none",
-        kind=args.uq_surrogate,
+        enabled=True,
+        kind="extra_trees",
         sobol_train_samples=args.uq_surrogate_sobol_train_samples,
         sobol_validation_samples=args.uq_surrogate_sobol_validation_samples,
-        ridge_alpha=float(args.uq_surrogate_ridge_alpha),
         max_rmse_c=float(args.uq_surrogate_max_rmse_c),
         max_abs_error_c=float(args.uq_surrogate_max_abs_error_c),
         min_prediction_samples=int(args.uq_surrogate_min_prediction_samples),
@@ -1787,8 +1811,8 @@ def main() -> None:
     )
     run_high_fidelity_no_data(
         preset=args.preset,
-        output_path=args.output_json,
-        summary_path=args.output_summary,
+        output_path=output_json,
+        summary_path=output_summary,
         lhs_samples=preset.lhs_samples if args.lhs_samples is None else args.lhs_samples,
         sobol_samples=preset.sobol_samples if args.sobol_samples is None else args.sobol_samples,
         seed=args.seed,
